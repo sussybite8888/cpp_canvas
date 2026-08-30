@@ -1,0 +1,1 @@
+/opt/homebrew/Cellar/emscripten/5.0.4/libexec/em++ -sWASM=1 -sALLOW_MEMORY_GROWTH=1 "-sEXPORTED_RUNTIME_METHODS=['ccall']" --shell-file /Users/darren/cpp_canvas/shell.html CMakeFiles/canvas_demo.dir/main.cpp.o CMakeFiles/canvas_demo.dir/canvas.cpp.o CMakeFiles/canvas_demo.dir/svg.cpp.o -o canvas_demo.html
