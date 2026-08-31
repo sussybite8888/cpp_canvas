@@ -1,0 +1,10 @@
+# Build trees
+build/
+build-web/
+cmake-build-*/
+
+# Demo output
+canvas-demo.ppm
+*.ppm
+
+.DS_Store

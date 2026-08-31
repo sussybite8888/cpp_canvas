@@ -1,10 +1,15 @@
 #include "canvas.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <utility>
 #ifndef __EMSCRIPTEN__
+#include "font.h"
 #include <SDL.h>
+static const Font* uiFont(unsigned char family);
 #endif
 
 namespace {
@@ -76,6 +81,348 @@ EM_JS(void, c2d_put_pixels, (int id,const std::uint8_t* data,int sw,int sh,int d
 #define OP(code,a,b,c,d,e,f,g,h,s) ((void)0)
 #endif
 
+#ifndef __EMSCRIPTEN__
+// ---------------------------------------------------------------------------
+// Software backend: flatten -> scanline coverage -> blend. Curves are really
+// flattened (not endpoint-approximated), fills honour both winding rules,
+// strokes are expanded to outlines, and clips are coverage masks.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kSub = 5;
+constexpr float kTau = 6.28318530718f;
+using Matrix = std::array<float,6>;
+
+struct Poly {
+    std::vector<float> pts; std::vector<int> ends; std::vector<char> closed;
+    void reset() { pts.clear(); ends.clear(); closed.clear(); }
+    int begin() const { return ends.empty() ? 0 : ends.back(); }
+    void finish(bool isClosed) {
+        const int n = static_cast<int>(pts.size()/2);
+        if (n - begin() < 1) { pts.resize(static_cast<size_t>(begin())*2); return; }
+        ends.push_back(n); closed.push_back(isClosed ? 1 : 0);
+    }
+};
+
+Poly gFlat, gDash, gOutline, gDevice;
+
+float matrixScale(const Matrix& m) { const float d = std::abs(m[0]*m[3]-m[1]*m[2]); return d > 0 ? std::sqrt(d) : 1e-3f; }
+
+void flatten(const Path2D& path, const Matrix& m, float scale, Poly& out) {
+    out.reset();
+    float cx=0, cy=0, sx=0, sy=0; bool open=false;
+    const auto emit=[&](float x,float y){ out.pts.push_back(m[0]*x+m[2]*y+m[4]); out.pts.push_back(m[1]*x+m[3]*y+m[5]); };
+    const auto start=[&](float x,float y){ if(open) out.finish(false); emit(x,y); open=true; cx=sx=x; cy=sy=y; };
+    const auto steps=[&](float length){ return std::clamp(static_cast<int>(std::ceil(std::sqrt(std::max(0.f,length)*scale)*1.8f)),2,192); };
+    const auto point=[&](float x,float y){ if(!open) start(x,y); else emit(x,y); cx=x; cy=y; };
+    for (const Path2D::Segment& s : path.segments()) {
+        const float* v = s.v;
+        switch (s.command) {
+        case Path2D::Command::Move: start(v[0],v[1]); break;
+        case Path2D::Command::Line: point(v[0],v[1]); break;
+        case Path2D::Command::Quadratic: {
+            if (!open) start(cx,cy);
+            const float x0=cx,y0=cy; const int n=steps(std::hypot(v[0]-x0,v[1]-y0)+std::hypot(v[2]-v[0],v[3]-v[1]));
+            for(int i=1;i<=n;++i){ const float t=float(i)/n,u=1-t;
+                emit(u*u*x0+2*u*t*v[0]+t*t*v[2], u*u*y0+2*u*t*v[1]+t*t*v[3]); }
+            cx=v[2]; cy=v[3]; break; }
+        case Path2D::Command::Bezier: {
+            if (!open) start(cx,cy);
+            const float x0=cx,y0=cy;
+            const int n=steps(std::hypot(v[0]-x0,v[1]-y0)+std::hypot(v[2]-v[0],v[3]-v[1])+std::hypot(v[4]-v[2],v[5]-v[3]));
+            for(int i=1;i<=n;++i){ const float t=float(i)/n,u=1-t, a=u*u*u,b=3*u*u*t,c=3*u*t*t,d=t*t*t;
+                emit(a*x0+b*v[0]+c*v[2]+d*v[4], a*y0+b*v[1]+c*v[3]+d*v[5]); }
+            cx=v[4]; cy=v[5]; break; }
+        case Path2D::Command::Arc:
+        case Path2D::Command::Ellipse: {
+            const bool circle = s.command==Path2D::Command::Arc;
+            const float ex=v[0], ey=v[1], rx=std::abs(v[2]), ry=circle?std::abs(v[2]):std::abs(v[3]);
+            const float rot=circle?0.f:v[4], a0=circle?v[3]:v[5], a1=circle?v[4]:v[6];
+            float sweep=a1-a0;
+            if (!s.counterClockwise) { if (sweep>=kTau) sweep=kTau; else { sweep=std::fmod(sweep,kTau); if(sweep<0) sweep+=kTau; } }
+            else { if (sweep<=-kTau) sweep=-kTau; else { sweep=std::fmod(sweep,kTau); if(sweep>0) sweep-=kTau; } }
+            const float cs=std::cos(rot), sn=std::sin(rot);
+            const auto at=[&](float t,float& ox,float& oy){ const float px=rx*std::cos(t), py=ry*std::sin(t); ox=ex+px*cs-py*sn; oy=ey+px*sn+py*cs; };
+            const int n=std::clamp(static_cast<int>(std::ceil(std::abs(sweep)*(1.5f+std::sqrt(std::max(rx,ry)*scale)))),4,512);
+            float px,py; at(a0,px,py); point(px,py);
+            for(int i=1;i<=n;++i){ at(a0+sweep*i/n,px,py); emit(px,py); }
+            cx=px; cy=py; break; }
+        case Path2D::Command::ArcTo: {
+            const float x0=cx,y0=cy, x1=v[0],y1=v[1], x2=v[2],y2=v[3], r=std::abs(v[4]);
+            const float ux=x0-x1, uy=y0-y1, wx=x2-x1, wy=y2-y1;
+            const float lu=std::hypot(ux,uy), lw=std::hypot(wx,wy);
+            if (lu<1e-6f || lw<1e-6f || r<1e-6f) { point(x1,y1); break; }
+            const float a0x=ux/lu, a0y=uy/lu, a1x=wx/lw, a1y=wy/lw;
+            const float cosA=std::clamp(a0x*a1x+a0y*a1y,-1.f,1.f), half=std::acos(cosA)/2;
+            if (std::abs(std::sin(half))<1e-6f) { point(x1,y1); break; }
+            const float dist=r/std::tan(half);
+            point(x1+a0x*dist, y1+a0y*dist); point(x1+a1x*dist, y1+a1y*dist); break; }
+        case Path2D::Command::Rect: {
+            if(open){ out.finish(false); open=false; }
+            emit(v[0],v[1]); emit(v[0]+v[2],v[1]); emit(v[0]+v[2],v[1]+v[3]); emit(v[0],v[1]+v[3]);
+            out.finish(true); cx=sx=v[0]; cy=sy=v[1]; break; }
+        case Path2D::Command::RoundRect: {
+            if(open){ out.finish(false); open=false; }
+            const float x=std::min(v[0],v[0]+v[2]), y=std::min(v[1],v[1]+v[3]);
+            const float w=std::abs(v[2]), h=std::abs(v[3]), r=std::clamp(v[4],0.f,std::min(w,h)/2);
+            const int n=std::clamp(static_cast<int>(std::ceil(std::sqrt(r*scale)*2.2f)),2,48);
+            const float cxs[4]={x+w-r,x+w-r,x+r,x+r}, cys[4]={y+r,y+h-r,y+h-r,y+r};
+            for(int corner=0;corner<4;++corner){ const float a=-1.5707963f+corner*1.5707963f;
+                for(int i=0;i<=n;++i){ const float t=a+i*1.5707963f/n; emit(cxs[corner]+std::cos(t)*r, cys[corner]+std::sin(t)*r); } }
+            out.finish(true); cx=sx=x; cy=sy=y; break; }
+        case Path2D::Command::Close:
+            if(open){ out.finish(true); open=false; } cx=sx; cy=sy; break;
+        }
+    }
+    if (open) out.finish(false);
+}
+
+bool polyBounds(const Poly& p, int width, int height, int& x0, int& y0, int& x1, int& y1) {
+    if (p.pts.empty()) return false;
+    float lo=1e30f, hi=-1e30f, top=1e30f, bottom=-1e30f;
+    for (size_t i=0;i<p.pts.size();i+=2) {
+        const float x=p.pts[i], y=p.pts[i+1];
+        if (!(std::isfinite(x)&&std::isfinite(y))) continue;
+        lo=std::min(lo,x); hi=std::max(hi,x); top=std::min(top,y); bottom=std::max(bottom,y);
+    }
+    if (hi<lo) return false;
+    x0=std::max(0,static_cast<int>(std::floor(lo))); x1=std::min(width,static_cast<int>(std::ceil(hi))+1);
+    y0=std::max(0,static_cast<int>(std::floor(top))); y1=std::min(height,static_cast<int>(std::ceil(bottom))+1);
+    return x0<x1 && y0<y1;
+}
+
+struct Edge { float x0,y0,x1,y1,dir; };
+
+template <class Emit>
+void scanFill(const Poly& poly, bool evenOdd, int width, int height, Emit emit) {
+    static std::vector<Edge> edges; static std::vector<int> order, active;
+    static std::vector<float> acc; static std::vector<std::pair<float,float>> xs;
+    int bx0,by0,bx1,by1; if (!polyBounds(poly,width,height,bx0,by0,bx1,by1)) return;
+    edges.clear();
+    int first=0;
+    for (size_t c=0;c<poly.ends.size();++c) {
+        const int last=poly.ends[c];
+        for (int i=first;i<last;++i) {
+            const int j=(i+1==last)?first:i+1;
+            const float ax=poly.pts[2*i], ay=poly.pts[2*i+1], bx=poly.pts[2*j], by=poly.pts[2*j+1];
+            if (ay==by || !(std::isfinite(ax)&&std::isfinite(ay)&&std::isfinite(bx)&&std::isfinite(by))) continue;
+            edges.push_back({ax,ay,bx,by, by>ay?1.f:-1.f});
+        }
+        first=last;
+    }
+    if (edges.empty()) return;
+    order.resize(edges.size());
+    for (size_t i=0;i<order.size();++i) order[i]=static_cast<int>(i);
+    std::sort(order.begin(),order.end(),[&](int a,int b){ return std::min(edges[a].y0,edges[a].y1) < std::min(edges[b].y0,edges[b].y1); });
+    acc.assign(static_cast<size_t>(bx1-bx0), 0.f);
+    active.clear(); size_t next=0;
+    for (int y=by0;y<by1;++y) {
+        const float top=static_cast<float>(y), bottom=top+1;
+        while (next<order.size() && std::min(edges[order[next]].y0,edges[order[next]].y1) < bottom) active.push_back(order[next++]);
+        active.erase(std::remove_if(active.begin(),active.end(),[&](int e){ return std::max(edges[e].y0,edges[e].y1) <= top; }), active.end());
+        if (active.empty()) continue;
+        bool touched=false;
+        const auto span=[&](float a,float b){
+            a=std::max(a,static_cast<float>(bx0)); b=std::min(b,static_cast<float>(bx1));
+            if (b<=a) return;
+            const float weight=1.f/kSub;
+            int ia=static_cast<int>(std::floor(a)), ib=static_cast<int>(std::floor(b));
+            ia=std::clamp(ia,bx0,bx1-1); ib=std::clamp(ib,bx0,bx1-1);
+            if (ia==ib) acc[ia-bx0]+=(b-a)*weight;
+            else { acc[ia-bx0]+=(ia+1-a)*weight; for(int x=ia+1;x<ib;++x) acc[x-bx0]+=weight; acc[ib-bx0]+=(b-ib)*weight; }
+            touched=true;
+        };
+        for (int s=0;s<kSub;++s) {
+            const float sy=y+(s+0.5f)/kSub;
+            xs.clear();
+            for (int e : active) {
+                const Edge& ed=edges[e];
+                const float lo=std::min(ed.y0,ed.y1), hi=std::max(ed.y0,ed.y1);
+                if (sy<lo||sy>=hi) continue;
+                xs.emplace_back(ed.x0+(sy-ed.y0)*(ed.x1-ed.x0)/(ed.y1-ed.y0), ed.dir);
+            }
+            if (xs.size()<2) continue;
+            std::sort(xs.begin(),xs.end());
+            float winding=0; int crossings=0;
+            for (size_t i=0;i+1<xs.size();++i) {
+                winding+=xs[i].second; ++crossings;
+                if (evenOdd ? (crossings&1) : (winding!=0)) span(xs[i].first, xs[i+1].first);
+            }
+        }
+        if (!touched) continue;
+        for (int x=bx0;x<bx1;++x) {
+            const float a=acc[x-bx0];
+            if (a>0.002f) emit(x,y,std::min(1.f,a));
+            acc[x-bx0]=0;
+        }
+    }
+}
+
+void pushContour(Poly& out, const std::vector<float>& pts) {
+    const size_t n=pts.size()/2;
+    if (n<3) return;
+    double area=0;
+    for (size_t i=0,j=n-1;i<n;j=i++) area += static_cast<double>(pts[2*j])*pts[2*i+1] - static_cast<double>(pts[2*i])*pts[2*j+1];
+    if (area>0) for (size_t i=n;i-->0;) { out.pts.push_back(pts[2*i]); out.pts.push_back(pts[2*i+1]); }
+    else for (size_t i=0;i<n;++i) { out.pts.push_back(pts[2*i]); out.pts.push_back(pts[2*i+1]); }
+    out.finish(true);
+}
+
+void pushDisc(Poly& out, float x, float y, float r, float scale) {
+    const int n=std::clamp(static_cast<int>(std::ceil(std::sqrt(r*scale)*4.f)),8,72);
+    std::vector<float> pts; pts.reserve(n*2);
+    for (int i=0;i<n;++i) { const float t=kTau*i/n; pts.push_back(x+std::cos(t)*r); pts.push_back(y+std::sin(t)*r); }
+    pushContour(out,pts);
+}
+
+// Segment quads, join wedges and caps are emitted as separately closed, equally
+// wound contours; a nonzero fill of the lot is exactly their union.
+void strokeOutline(const Poly& src, float hw, int cap, int join, float miterLimit, float scale, Poly& out) {
+    out.reset();
+    if (hw<=0) return;
+    std::vector<float> pts, quad;
+    int first=0;
+    for (size_t c=0;c<src.ends.size();++c) {
+        const int last=src.ends[c]; const bool closed=src.closed[c]!=0;
+        pts.clear();
+        for (int i=first;i<last;++i) {
+            const float x=src.pts[2*i], y=src.pts[2*i+1];
+            if (!(std::isfinite(x)&&std::isfinite(y))) continue;
+            if (pts.size()>=2 && std::abs(pts[pts.size()-2]-x)<1e-6f && std::abs(pts.back()-y)<1e-6f) continue;
+            pts.push_back(x); pts.push_back(y);
+        }
+        first=last;
+        if (closed && pts.size()>=4 && std::abs(pts[0]-pts[pts.size()-2])<1e-6f && std::abs(pts[1]-pts.back())<1e-6f) pts.resize(pts.size()-2);
+        const int n=static_cast<int>(pts.size()/2);
+        if (n==0) continue;
+        if (n==1) {
+            if (cap==1) pushDisc(out,pts[0],pts[1],hw,scale);
+            else if (cap==2) { quad={pts[0]-hw,pts[1]-hw,pts[0]+hw,pts[1]-hw,pts[0]+hw,pts[1]+hw,pts[0]-hw,pts[1]+hw}; pushContour(out,quad); }
+            continue;
+        }
+        const int segments = closed ? n : n-1;
+        for (int i=0;i<segments;++i) {
+            const int j=(i+1)%n;
+            const float ax=pts[2*i], ay=pts[2*i+1], bx=pts[2*j], by=pts[2*j+1];
+            const float dx=bx-ax, dy=by-ay, len=std::hypot(dx,dy);
+            if (len<1e-9f) continue;
+            const float nx=-dy/len*hw, ny=dx/len*hw;
+            quad={ax+nx,ay+ny,bx+nx,by+ny,bx-nx,by-ny,ax-nx,ay-ny};
+            pushContour(out,quad);
+        }
+        const int joins = closed ? n : n-1;
+        for (int k = closed?0:1; k<joins; ++k) {
+            const int prev=(k-1+n)%n, cur=k, nxt=(k+1)%n;
+            const float px=pts[2*cur], py=pts[2*cur+1];
+            float d0x=px-pts[2*prev], d0y=py-pts[2*prev+1], d1x=pts[2*nxt]-px, d1y=pts[2*nxt+1]-py;
+            const float l0=std::hypot(d0x,d0y), l1=std::hypot(d1x,d1y);
+            if (l0<1e-9f||l1<1e-9f) continue;
+            d0x/=l0; d0y/=l0; d1x/=l1; d1y/=l1;
+            const float cross=d0x*d1y-d0y*d1x;
+            if (std::abs(cross)<1e-6f && d0x*d1x+d0y*d1y>0) continue;
+            if (join==1) { pushDisc(out,px,py,hw,scale); continue; }
+            const float side = cross>0 ? -1.f : 1.f;
+            const float o0x=-d0y*hw*side, o0y=d0x*hw*side, o1x=-d1y*hw*side, o1y=d1x*hw*side;
+            quad={px,py,px+o0x,py+o0y,px+o1x,py+o1y}; pushContour(out,quad);
+            quad={px,py,px-o0x,py-o0y,px-o1x,py-o1y}; pushContour(out,quad);
+            if (join!=0) continue;
+            const float denom=-cross;
+            if (std::abs(denom)<1e-9f) continue;
+            const float rx=o1x-o0x, ry=o1y-o0y;
+            const float t=(rx*(-d1y)-ry*(-d1x))/denom;
+            const float qx=px+o0x+t*d0x, qy=py+o0y+t*d0y;
+            if (std::hypot(qx-px,qy-py) > miterLimit*hw) continue;
+            quad={px,py,px+o0x,py+o0y,qx,qy,px+o1x,py+o1y}; pushContour(out,quad);
+        }
+        if (closed || cap==0) continue;
+        for (int e=0;e<2;++e) {
+            const int at = e==0 ? 0 : n-1;
+            const int other = e==0 ? 1 : n-2;
+            float dx=pts[2*at]-pts[2*other], dy=pts[2*at+1]-pts[2*other+1];
+            const float len=std::hypot(dx,dy); if (len<1e-9f) continue;
+            dx/=len; dy/=len;
+            const float ex=pts[2*at], ey=pts[2*at+1];
+            if (cap==1) { pushDisc(out,ex,ey,hw,scale); continue; }
+            const float nx=-dy*hw, ny=dx*hw;
+            quad={ex+nx,ey+ny,ex+nx+dx*hw,ey+ny+dy*hw,ex-nx+dx*hw,ey-ny+dy*hw,ex-nx,ey-ny};
+            pushContour(out,quad);
+        }
+    }
+}
+
+void applyDash(const Poly& src, const std::vector<float>& dash, float offset, Poly& out) {
+    out.reset();
+    float total=0; for (float d : dash) total += std::max(0.f,d);
+    if (total<=1e-6f) { out=src; return; }
+    const size_t count=dash.size();
+    int first=0;
+    for (size_t c=0;c<src.ends.size();++c) {
+        const int last=src.ends[c]; const bool closed=src.closed[c]!=0;
+        size_t index=0; float remaining=0; bool on=true;
+        float carry=std::fmod(offset,total*((count&1)?2:1)); if (carry<0) carry+=total*((count&1)?2:1);
+        while (carry>0) { const float d=std::max(0.f,dash[index%count]); if (carry<d) { remaining=d-carry; carry=0; } else { carry-=d; ++index; on=!on; } }
+        if (remaining<=0) { remaining=std::max(0.f,dash[index%count]); }
+        bool started=false;
+        const int total_points = closed ? (last-first+1) : (last-first);
+        for (int i=1;i<total_points;++i) {
+            const int a=first+((i-1)%(last-first)), b=first+(i%(last-first));
+            float ax=src.pts[2*a], ay=src.pts[2*a+1];
+            const float bx=src.pts[2*b], by=src.pts[2*b+1];
+            float segment=std::hypot(bx-ax,by-ay);
+            while (segment>1e-9f) {
+                if (on && !started) { out.pts.push_back(ax); out.pts.push_back(ay); started=true; }
+                if (remaining>=segment) {
+                    remaining-=segment;
+                    if (on) { out.pts.push_back(bx); out.pts.push_back(by); }
+                    segment=0;
+                } else {
+                    const float t=remaining/segment;
+                    const float mx=ax+(bx-ax)*t, my=ay+(by-ay)*t;
+                    if (on) { out.pts.push_back(mx); out.pts.push_back(my); out.finish(false); started=false; }
+                    ax=mx; ay=my; segment-=remaining;
+                    ++index; on=!on; remaining=std::max(1e-6f,dash[index%count]);
+                }
+            }
+        }
+        if (started) out.finish(false);
+        first=last;
+    }
+}
+
+void transformPoly(const Poly& in, const Matrix& m, Poly& out) {
+    out.reset();
+    out.pts.resize(in.pts.size());
+    for (size_t i=0;i<in.pts.size();i+=2) {
+        const float x=in.pts[i], y=in.pts[i+1];
+        out.pts[i]=m[0]*x+m[2]*y+m[4]; out.pts[i+1]=m[1]*x+m[3]*y+m[5];
+    }
+    out.ends=in.ends; out.closed=in.closed;
+}
+
+// 5x7 cell font, column-major bits, ASCII 32..126.
+const unsigned char kFont[95][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5f,0x00,0x00}, {0x00,0x03,0x00,0x03,0x00}, {0x14,0x7f,0x14,0x7f,0x14}, {0x24,0x2a,0x7f,0x2a,0x12},
+    {0x63,0x13,0x08,0x64,0x63}, {0x36,0x49,0x55,0x22,0x50}, {0x00,0x00,0x03,0x00,0x00}, {0x00,0x1c,0x22,0x41,0x00}, {0x00,0x41,0x22,0x1c,0x00},
+    {0x2a,0x1c,0x3e,0x1c,0x2a}, {0x08,0x08,0x3e,0x08,0x08}, {0x00,0x40,0x30,0x10,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x60,0x60,0x00,0x00},
+    {0x60,0x10,0x08,0x04,0x03}, {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00}, {0x62,0x51,0x49,0x49,0x46}, {0x41,0x49,0x49,0x49,0x36},
+    {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39}, {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1e}, {0x00,0x36,0x36,0x00,0x00}, {0x40,0x36,0x16,0x00,0x00}, {0x08,0x14,0x22,0x41,0x00}, {0x14,0x14,0x14,0x14,0x14},
+    {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x59,0x09,0x06}, {0x3e,0x41,0x5d,0x55,0x1e}, {0x7c,0x12,0x11,0x12,0x7c}, {0x7f,0x49,0x49,0x49,0x36},
+    {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c}, {0x7f,0x49,0x49,0x49,0x41}, {0x7f,0x09,0x09,0x09,0x01}, {0x3e,0x41,0x49,0x49,0x3a},
+    {0x7f,0x08,0x08,0x08,0x7f}, {0x00,0x41,0x7f,0x41,0x00}, {0x30,0x40,0x40,0x41,0x3f}, {0x7f,0x08,0x14,0x22,0x41}, {0x7f,0x40,0x40,0x40,0x40},
+    {0x7f,0x02,0x0c,0x02,0x7f}, {0x7f,0x06,0x08,0x30,0x7f}, {0x3e,0x41,0x41,0x41,0x3e}, {0x7f,0x09,0x09,0x09,0x06}, {0x3e,0x41,0x51,0x21,0x5e},
+    {0x7f,0x09,0x19,0x29,0x46}, {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7f,0x01,0x01}, {0x3f,0x40,0x40,0x40,0x3f}, {0x1f,0x20,0x40,0x20,0x1f},
+    {0x7f,0x20,0x18,0x20,0x7f}, {0x63,0x14,0x08,0x14,0x63}, {0x03,0x04,0x78,0x04,0x03}, {0x61,0x51,0x49,0x45,0x43}, {0x00,0x00,0x7f,0x41,0x41},
+    {0x03,0x04,0x08,0x10,0x60}, {0x41,0x41,0x7f,0x00,0x00}, {0x04,0x02,0x01,0x02,0x04}, {0x40,0x40,0x40,0x40,0x40}, {0x00,0x01,0x02,0x00,0x00},
+    {0x20,0x54,0x54,0x54,0x78}, {0x7f,0x44,0x44,0x44,0x38}, {0x38,0x44,0x44,0x44,0x20}, {0x38,0x44,0x44,0x44,0x7f}, {0x38,0x54,0x54,0x54,0x18},
+    {0x08,0x7e,0x09,0x09,0x02}, {0x0c,0x52,0x52,0x52,0x3e}, {0x7f,0x04,0x04,0x04,0x78}, {0x00,0x44,0x7d,0x40,0x00}, {0x20,0x40,0x44,0x3d,0x00},
+    {0x7f,0x10,0x28,0x44,0x00}, {0x00,0x41,0x7f,0x40,0x00}, {0x7c,0x04,0x38,0x04,0x78}, {0x7c,0x04,0x04,0x04,0x78}, {0x38,0x44,0x44,0x44,0x38},
+    {0x7e,0x12,0x12,0x12,0x0c}, {0x0c,0x12,0x12,0x12,0x7e}, {0x7c,0x08,0x04,0x04,0x08}, {0x48,0x4c,0x54,0x74,0x24}, {0x04,0x3f,0x44,0x44,0x20},
+    {0x3c,0x40,0x40,0x40,0x7c}, {0x1c,0x20,0x40,0x20,0x1c}, {0x3c,0x40,0x38,0x40,0x3c}, {0x44,0x28,0x10,0x28,0x44}, {0x0e,0x50,0x50,0x50,0x3e},
+    {0x44,0x64,0x54,0x4c,0x44}, {0x00,0x08,0x36,0x41,0x41}, {0x00,0x00,0x7f,0x00,0x00}, {0x41,0x41,0x36,0x08,0x00}, {0x18,0x04,0x08,0x10,0x0c},
+};
+} // namespace
+#endif
+
 Canvas::Canvas(int w,int h,std::string id) : width_(std::max(1,w)),height_(std::max(1,h)),elementId_(std::move(id)) {
 #ifdef __EMSCRIPTEN__
   contextId_=c2d_create(elementId_.c_str(),width_,height_,0);
@@ -96,6 +443,9 @@ Canvas::Canvas(Canvas&& other) noexcept
       elementId_(std::move(other.elementId_)), fill_(other.fill_), stroke_(other.stroke_),
       lineWidth_(other.lineWidth_), currentPath_(std::move(other.currentPath_)), pixels_(std::move(other.pixels_)) {
   other.contextId_ = -1;
+#ifndef __EMSCRIPTEN__
+  state_ = std::move(other.state_); stack_ = std::move(other.stack_);
+#endif
 }
 Canvas& Canvas::operator=(Canvas&& other) noexcept {
   if (this == &other) return *this;
@@ -105,6 +455,9 @@ Canvas& Canvas::operator=(Canvas&& other) noexcept {
   width_=other.width_; height_=other.height_; contextId_=other.contextId_; virtual_=other.virtual_;
   elementId_=std::move(other.elementId_); fill_=other.fill_; stroke_=other.stroke_; lineWidth_=other.lineWidth_;
   currentPath_=std::move(other.currentPath_); pixels_=std::move(other.pixels_); other.contextId_=-1;
+#ifndef __EMSCRIPTEN__
+  state_=std::move(other.state_); stack_=std::move(other.stack_);
+#endif
   return *this;
 }
 Canvas::~Canvas() {
@@ -123,61 +476,128 @@ static std::string css(Color c) { return "rgba("+std::to_string(c.r)+","+std::to
 void Canvas::save() {
   OP(0,0,0,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  matrixStack_.push_back(matrix_);
+  stack_.push_back(state_);
 #endif
 }
 void Canvas::restore() {
   OP(1,0,0,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  if (!matrixStack_.empty()) { matrix_=matrixStack_.back(); matrixStack_.pop_back(); }
+  if (!stack_.empty()) { state_=std::move(stack_.back()); stack_.pop_back(); fill_=state_.fill; stroke_=state_.stroke; lineWidth_=state_.lineWidth; }
 #endif
 }
-void Canvas::reset() { OP(2,0,0,0,0,0,0,0,0,""); resetTransform(); }
+void Canvas::reset() { OP(2,0,0,0,0,0,0,0,0,""); resetTransform();
+#ifndef __EMSCRIPTEN__
+  state_=State{}; stack_.clear();
+#endif
+}
 void Canvas::scale(float a,float b) { OP(3,a,b,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  matrix_[0]*=a; matrix_[1]*=a; matrix_[2]*=b; matrix_[3]*=b;
+  auto& m=state_.matrix; m[0]*=a; m[1]*=a; m[2]*=b; m[3]*=b;
 #endif
 }
 void Canvas::rotate(float a) { OP(4,a,0,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  const float c=std::cos(a), s=std::sin(a), m0=matrix_[0],m1=matrix_[1],m2=matrix_[2],m3=matrix_[3];
-  matrix_[0]=m0*c+m2*s; matrix_[1]=m1*c+m3*s; matrix_[2]=m2*c-m0*s; matrix_[3]=m3*c-m1*s;
+  auto& m=state_.matrix; const float c=std::cos(a), s=std::sin(a), m0=m[0],m1=m[1],m2=m[2],m3=m[3];
+  m[0]=m0*c+m2*s; m[1]=m1*c+m3*s; m[2]=m2*c-m0*s; m[3]=m3*c-m1*s;
 #endif
 }
 void Canvas::translate(float a,float b) { OP(5,a,b,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  matrix_[4]+=matrix_[0]*a+matrix_[2]*b; matrix_[5]+=matrix_[1]*a+matrix_[3]*b;
+  auto& m=state_.matrix; m[4]+=m[0]*a+m[2]*b; m[5]+=m[1]*a+m[3]*b;
 #endif
 }
 void Canvas::transform(float a,float b,float c,float d,float e,float f) {
   OP(6,a,b,c,d,e,f,0,0,"");
 #ifndef __EMSCRIPTEN__
-  const auto m=matrix_; matrix_[0]=m[0]*a+m[2]*b; matrix_[1]=m[1]*a+m[3]*b;
-  matrix_[2]=m[0]*c+m[2]*d; matrix_[3]=m[1]*c+m[3]*d; matrix_[4]=m[0]*e+m[2]*f+m[4]; matrix_[5]=m[1]*e+m[3]*f+m[5];
+  const auto m=state_.matrix; auto& o=state_.matrix;
+  o[0]=m[0]*a+m[2]*b; o[1]=m[1]*a+m[3]*b; o[2]=m[0]*c+m[2]*d; o[3]=m[1]*c+m[3]*d;
+  o[4]=m[0]*e+m[2]*f+m[4]; o[5]=m[1]*e+m[3]*f+m[5];
 #endif
 }
 void Canvas::setTransform(float a,float b,float c,float d,float e,float f) { OP(7,a,b,c,d,e,f,0,0,"");
 #ifndef __EMSCRIPTEN__
-  matrix_={a,b,c,d,e,f};
+  state_.matrix={a,b,c,d,e,f};
 #endif
 }
 void Canvas::resetTransform() { OP(8,0,0,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  matrix_={1,0,0,1,0,0};
+  state_.matrix={1,0,0,1,0,0};
 #endif
 }
-void Canvas::setFillStyle(Color c){fill_=c;setFillStyle(css(c));} void Canvas::setStrokeStyle(Color c){stroke_=c;setStrokeStyle(css(c));} void Canvas::setFillStyle(const std::string&s){OP(9,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setStrokeStyle(const std::string&s){OP(10,0,0,0,0,0,0,0,0,s.c_str());}
-void Canvas::setGlobalAlpha(float a){OP(11,a,0,0,0,0,0,0,0,"");} void Canvas::setGlobalCompositeOperation(const std::string&s){OP(12,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setFilter(const std::string&s){OP(13,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setLineWidth(float a){lineWidth_=std::max(0.f,a);OP(14,lineWidth_,0,0,0,0,0,0,0,"");}
-void Canvas::setLineCap(const std::string&s){OP(15,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setLineJoin(const std::string&s){OP(16,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setMiterLimit(float a){OP(17,a,0,0,0,0,0,0,0,"");}
+void Canvas::setFillStyle(Color c){fill_=c;
+#ifndef __EMSCRIPTEN__
+  state_.fill=c;
+#endif
+  setFillStyle(css(c));}
+void Canvas::setStrokeStyle(Color c){stroke_=c;
+#ifndef __EMSCRIPTEN__
+  state_.stroke=c;
+#endif
+  setStrokeStyle(css(c));}
+void Canvas::setFillStyle(const std::string&s){OP(9,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setStrokeStyle(const std::string&s){OP(10,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setGlobalAlpha(float a){OP(11,a,0,0,0,0,0,0,0,"");
+#ifndef __EMSCRIPTEN__
+  state_.alpha=std::clamp(a,0.f,1.f);
+#endif
+}
+void Canvas::setGlobalCompositeOperation(const std::string&s){OP(12,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setFilter(const std::string&s){OP(13,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setLineWidth(float a){lineWidth_=std::max(0.f,a);OP(14,lineWidth_,0,0,0,0,0,0,0,"");
+#ifndef __EMSCRIPTEN__
+  state_.lineWidth=lineWidth_;
+#endif
+}
+void Canvas::setLineCap(const std::string&s){OP(15,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  state_.lineCap = s=="round"?1 : s=="square"?2 : 0;
+#endif
+}
+void Canvas::setLineJoin(const std::string&s){OP(16,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  state_.lineJoin = s=="round"?1 : s=="bevel"?2 : 0;
+#endif
+}
+void Canvas::setMiterLimit(float a){OP(17,a,0,0,0,0,0,0,0,"");
+#ifndef __EMSCRIPTEN__
+  state_.miterLimit=std::max(1.f,a);
+#endif
+}
 void Canvas::setLineDash(const std::vector<float>&v) {
 #ifdef __EMSCRIPTEN__
   c2d_dash(contextId_, v.data(), static_cast<int>(v.size()));
 #else
-  (void)v;
+  state_.dash=v;
 #endif
 }
-void Canvas::setLineDashOffset(float a){OP(18,a,0,0,0,0,0,0,0,"");}
-void Canvas::setShadow(Color c,float a,float b,float d){auto s=css(c);OP(19,a,b,d,0,0,0,0,0,s.c_str());} void Canvas::setFont(const std::string&s){OP(20,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setTextAlign(const std::string&s){OP(21,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setTextBaseline(const std::string&s){OP(22,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setDirection(const std::string&s){OP(23,0,0,0,0,0,0,0,0,s.c_str());} void Canvas::setImageSmoothingEnabled(bool a){OP(24,a,0,0,0,0,0,0,0,"");} void Canvas::setImageSmoothingQuality(const std::string&s){OP(25,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setLineDashOffset(float a){OP(18,a,0,0,0,0,0,0,0,"");
+#ifndef __EMSCRIPTEN__
+  state_.dashOffset=a;
+#endif
+}
+void Canvas::setShadow(Color c,float a,float b,float d){auto s=css(c);OP(19,a,b,d,0,0,0,0,0,s.c_str());}
+void Canvas::setFont(const std::string&s){OP(20,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  for (size_t i=0;i<s.size();++i) if (std::isdigit(static_cast<unsigned char>(s[i]))) { state_.fontSize=std::max(1.f,std::strtof(s.c_str()+i,nullptr)); break; }
+  std::string f=s; for (char& c : f) c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  state_.fontFamily = f.find("mono")!=std::string::npos||f.find("courier")!=std::string::npos ? 2
+                    : f.find("sans")!=std::string::npos ? 0
+                    : f.find("serif")!=std::string::npos||f.find("times")!=std::string::npos||f.find("georgia")!=std::string::npos ? 1 : 0;
+#endif
+}
+void Canvas::setTextAlign(const std::string&s){OP(21,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  state_.textAlign = (s=="center")?1 : (s=="right"||s=="end")?2 : 0;
+#endif
+}
+void Canvas::setTextBaseline(const std::string&s){OP(22,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  state_.textBaseline = (s=="top"||s=="hanging")?0 : (s=="middle")?1 : (s=="bottom"||s=="ideographic")?2 : 3;
+#endif
+}
+void Canvas::setDirection(const std::string&s){OP(23,0,0,0,0,0,0,0,0,s.c_str());}
+void Canvas::setImageSmoothingEnabled(bool a){OP(24,a,0,0,0,0,0,0,0,"");}
+void Canvas::setImageSmoothingQuality(const std::string&s){OP(25,0,0,0,0,0,0,0,0,s.c_str());}
 void Canvas::clear(Color c) {
 #ifdef __EMSCRIPTEN__
   save(); resetTransform(); setFillStyle(c); fillRect(0,0,width_,height_); restore();
@@ -188,22 +608,26 @@ void Canvas::clear(Color c) {
 void Canvas::clearRect(float a,float b,float c,float d) {
   OP(30,a,b,c,d,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  for (int y=std::max(0,(int)std::floor(b)); y<std::min(height_,(int)std::ceil(b+d)); ++y)
-    for (int x=std::max(0,(int)std::floor(a)); x<std::min(width_,(int)std::ceil(a+c)); ++x)
-      pixels_[size_t(y)*width_+x]=Color{0,0,0,0};
+  Path2D box; box.rect(a,b,c,d);
+  flatten(box, state_.matrix, matrixScale(state_.matrix), gFlat);
+  scanFill(gFlat,false,width_,height_,[&](int x,int y,float cov){
+    const float keep=1.f-cov*clipAt(x,y);
+    Color& p=pixels_[static_cast<size_t>(y)*width_+x];
+    p.a=static_cast<std::uint8_t>(std::lround(p.a*keep));
+    if (p.a==0) p=Color{0,0,0,0};
+  });
 #endif
 }
 void Canvas::fillRect(float a,float b,float c,float d) {
   OP(31,a,b,c,d,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  for(int y=std::max(0,(int)std::floor(b));y<std::min(height_,(int)std::ceil(b+d));++y)
-    for(int x=std::max(0,(int)std::floor(a));x<std::min(width_,(int)std::ceil(a+c));++x) blendPixel(x,y,fill_);
+  Path2D box; box.rect(a,b,c,d); fillDevice(box,false,state_.fill);
 #endif
 }
 void Canvas::strokeRect(float a,float b,float c,float d) {
   OP(32,a,b,c,d,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  drawLine(a,b,a+c,b);drawLine(a+c,b,a+c,b+d);drawLine(a+c,b+d,a,b+d);drawLine(a,b+d,a,b);
+  Path2D box; box.rect(a,b,c,d); strokeDevice(box);
 #endif
 }
 void Canvas::beginPath(){currentPath_=Path2D{};OP(33,0,0,0,0,0,0,0,0,"");} void Canvas::closePath(){currentPath_.closePath();OP(34,0,0,0,0,0,0,0,0,"");} void Canvas::moveTo(float a,float b){currentPath_.moveTo(a,b);OP(35,a,b,0,0,0,0,0,0,"");} void Canvas::lineTo(float a,float b){currentPath_.lineTo(a,b);OP(36,a,b,0,0,0,0,0,0,"");}
@@ -211,99 +635,75 @@ void Canvas::quadraticCurveTo(float a,float b,float c,float d){currentPath_.quad
 void Canvas::fill(const std::string&s){
   OP(44,0,0,0,0,0,0,0,0,s.c_str());
 #ifndef __EMSCRIPTEN__
-  fill(currentPath_, s);
+  fillDevice(currentPath_, s=="evenodd", state_.fill);
 #endif
 }
 void Canvas::stroke() {
   OP(45,0,0,0,0,0,0,0,0,"");
 #ifndef __EMSCRIPTEN__
-  const auto& v=currentPath_.segments(); float x=0,y=0,startX=0,startY=0;
-  for(auto&q:v) {
-    if(q.command==Path2D::Command::Move) { x=startX=q.v[0]; y=startY=q.v[1]; }
-    else if(q.command==Path2D::Command::Line) { const auto a=mapPoint(x,y),b=mapPoint(q.v[0],q.v[1]); drawLine(a.first,a.second,b.first,b.second); x=q.v[0]; y=q.v[1]; }
-    else if(q.command==Path2D::Command::Close) { const auto a=mapPoint(x,y),b=mapPoint(startX,startY); drawLine(a.first,a.second,b.first,b.second); x=startX; y=startY; }
-  }
+  strokeDevice(currentPath_);
 #endif
 }
-void Canvas::clip(const std::string&s){OP(46,0,0,0,0,0,0,0,0,s.c_str());}
-static std::vector<float> pack(const Path2D&p){std::vector<float>r;p.segments().size();r.reserve(p.segments().size()*10);for(auto&q:p.segments()){r.push_back((float)q.command);r.push_back(q.counterClockwise);for(float x:q.v)r.push_back(x);}return r;}
+void Canvas::clip(const std::string&s){
+  OP(46,0,0,0,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  clip(currentPath_, s);
+#endif
+}
+static std::vector<float> pack(const Path2D&p){std::vector<float>r;r.reserve(p.segments().size()*10);for(auto&q:p.segments()){r.push_back((float)q.command);r.push_back(q.counterClockwise);for(float x:q.v)r.push_back(x);}return r;}
 void Canvas::fill(const Path2D&p,const std::string&s) {
 #ifdef __EMSCRIPTEN__
   auto v=pack(p); c2d_path(contextId_,v.data(),static_cast<int>(p.segments().size()),0,s.c_str());
 #else
-  (void)s;
-  // Even-odd scan conversion for line/rectangle SVG paths. Curved segments are
-  // intentionally approximated by their endpoint in this software fallback.
-  std::vector<std::vector<std::pair<float,float>>> contours;
-  std::vector<std::pair<float,float>> contour;
-  const auto point = [this](float x, float y) { return mapPoint(x, y); };
-  for (const auto& q : p.segments()) {
-    if (q.command == Path2D::Command::Move) { if (!contour.empty()) contours.push_back(contour); contour={point(q.v[0],q.v[1])}; }
-    else if (q.command == Path2D::Command::Line) contour.push_back(point(q.v[0],q.v[1]));
-    else if (q.command == Path2D::Command::Rect) {
-      if (!contour.empty()) contours.push_back(contour);
-      contour={point(q.v[0],q.v[1]),point(q.v[0]+q.v[2],q.v[1]),point(q.v[0]+q.v[2],q.v[1]+q.v[3]),point(q.v[0],q.v[1]+q.v[3])};
-    } else if (q.command == Path2D::Command::RoundRect) {
-      if (!contour.empty()) contours.push_back(contour);
-      contour.clear();
-      const float x=q.v[0], y=q.v[1], w=q.v[2], h=q.v[3];
-      const float r=std::clamp(q.v[4], 0.f, std::min(std::abs(w),std::abs(h))/2.f);
-      const float left=std::min(x,x+w), right=std::max(x,x+w), top=std::min(y,y+h), bottom=std::max(y,y+h);
-      // Clockwise quarter-arcs make the same retained path work in software and Canvas 2D.
-      for (int corner=0;corner<4;++corner) {
-        const float cx=corner==0?right-r:corner==1?right-r:corner==2?left+r:left+r;
-        const float cy=corner==0?top+r:corner==1?bottom-r:corner==2?bottom-r:top+r;
-        const float start=-1.5707963f+corner*1.5707963f;
-        for (int step=0;step<=8;++step) { const float t=start+step*1.5707963f/8; contour.push_back(point(cx+std::cos(t)*r,cy+std::sin(t)*r)); }
-      }
-    }
-    else if (q.command == Path2D::Command::Arc || q.command == Path2D::Command::Ellipse) {
-      if (!contour.empty()) contours.push_back(contour); contour.clear();
-      const float cx=q.v[0], cy=q.v[1], rx=q.v[2], ry=q.command==Path2D::Command::Ellipse?q.v[3]:q.v[2];
-      for (int i=0;i<32;++i) { float t=6.2831853f*i/32; contour.push_back(point(cx+std::cos(t)*rx,cy+std::sin(t)*ry)); }
-    } else if (q.command == Path2D::Command::Quadratic) contour.push_back(point(q.v[2],q.v[3]));
-    else if (q.command == Path2D::Command::Bezier) contour.push_back(point(q.v[4],q.v[5]));
-  }
-  if (!contour.empty()) contours.push_back(contour);
-  if (contours.empty()) return;
-  float minX=static_cast<float>(width_), minY=static_cast<float>(height_), maxX=0, maxY=0;
-  for (const auto& c : contours) for (const auto& point : c) {
-    minX=std::min(minX,point.first); minY=std::min(minY,point.second);
-    maxX=std::max(maxX,point.first); maxY=std::max(maxY,point.second);
-  }
-  const int startX=std::max(0,static_cast<int>(std::floor(minX)));
-  const int startY=std::max(0,static_cast<int>(std::floor(minY)));
-  const int endX=std::min(width_,static_cast<int>(std::ceil(maxX)));
-  const int endY=std::min(height_,static_cast<int>(std::ceil(maxY)));
-  for (int y=startY;y<endY;++y) for (int x=startX;x<endX;++x) {
-    bool inside=false; const float py=y+.5f, px=x+.5f;
-    for (const auto& c:contours) for(size_t i=0,j=c.size()?c.size()-1:0;i<c.size();j=i++) {
-      const auto& a=c[i];const auto& b=c[j];
-      if ((a.second>py)!=(b.second>py) && px<(b.first-a.first)*(py-a.second)/(b.second-a.second)+a.first) inside=!inside;
-    }
-    if(inside) blendPixel(x,y,fill_);
-  }
+  fillDevice(p, s=="evenodd", state_.fill);
 #endif
 }
 void Canvas::stroke(const Path2D&p) {
 #ifdef __EMSCRIPTEN__
   auto v=pack(p); c2d_path(contextId_,v.data(),static_cast<int>(p.segments().size()),1,"");
 #else
-  auto old=currentPath_; currentPath_=p; stroke(); currentPath_=std::move(old);
+  strokeDevice(p);
 #endif
 }
 void Canvas::clip(const Path2D&p,const std::string&s) {
 #ifdef __EMSCRIPTEN__
   auto v=pack(p); c2d_path(contextId_,v.data(),static_cast<int>(p.segments().size()),2,s.c_str());
 #else
-  (void)p; (void)s;
+  flatten(p, state_.matrix, matrixScale(state_.matrix), gFlat);
+  auto mask=std::make_shared<ClipMask>();
+  int x0,y0,x1,y1;
+  if (!polyBounds(gFlat,width_,height_,x0,y0,x1,y1)) { mask->x0=mask->y0=mask->x1=mask->y1=0; state_.clip=mask; return; }
+  if (const ClipMask* old=state_.clip.get()) { x0=std::max(x0,old->x0); y0=std::max(y0,old->y0); x1=std::min(x1,old->x1); y1=std::min(y1,old->y1); }
+  if (x1<=x0||y1<=y0) { mask->x0=mask->y0=mask->x1=mask->y1=0; state_.clip=mask; return; }
+  mask->x0=x0; mask->y0=y0; mask->x1=x1; mask->y1=y1;
+  mask->alpha.assign(static_cast<size_t>(x1-x0)*(y1-y0),0);
+  const bool evenOdd = s=="evenodd";
+  scanFill(gFlat,evenOdd,width_,height_,[&](int x,int y,float cov){
+    if (x<x0||x>=x1||y<y0||y>=y1) return;
+    const float v=cov*clipAt(x,y);
+    mask->alpha[static_cast<size_t>(y-y0)*(x1-x0)+(x-x0)]=static_cast<std::uint8_t>(std::lround(std::clamp(v,0.f,1.f)*255));
+  });
+  state_.clip=mask;
 #endif
 }
 bool Canvas::isPointInPath(float a,float b,const std::string&s)const {
 #ifdef __EMSCRIPTEN__
   return c2d_hit(contextId_,a,b,0,s.c_str());
 #else
-  (void)a;(void)b;(void)s; return false;
+  flatten(currentPath_, state_.matrix, matrixScale(state_.matrix), gFlat);
+  const bool evenOdd = s=="evenodd";
+  int winding=0, crossings=0, first=0;
+  for (size_t c=0;c<gFlat.ends.size();++c) {
+    const int last=gFlat.ends[c];
+    for (int i=first;i<last;++i) {
+      const int j=(i+1==last)?first:i+1;
+      const float ax=gFlat.pts[2*i],ay=gFlat.pts[2*i+1],bx=gFlat.pts[2*j],by=gFlat.pts[2*j+1];
+      if ((ay>b)==(by>b)) continue;
+      if (a < ax+(b-ay)*(bx-ax)/(by-ay)) { ++crossings; winding += by>ay ? 1 : -1; }
+    }
+    first=last;
+  }
+  return evenOdd ? (crossings&1)!=0 : winding!=0;
 #endif
 }
 bool Canvas::isPointInStroke(float a,float b)const {
@@ -313,13 +713,22 @@ bool Canvas::isPointInStroke(float a,float b)const {
   (void)a;(void)b; return false;
 #endif
 }
-void Canvas::fillText(const std::string&s,float a,float b,float c){OP(47,c,a,b,0,0,0,0,0,s.c_str());}
-void Canvas::strokeText(const std::string&s,float a,float b,float c){OP(48,c,a,b,0,0,0,0,0,s.c_str());}
+void Canvas::fillText(const std::string&s,float a,float b,float c){OP(47,c,a,b,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  glyphs(s,a,b,c,state_.fill);
+#endif
+}
+void Canvas::strokeText(const std::string&s,float a,float b,float c){OP(48,c,a,b,0,0,0,0,0,s.c_str());
+#ifndef __EMSCRIPTEN__
+  glyphs(s,a,b,c,state_.stroke);
+#endif
+}
 float Canvas::measureText(const std::string&s)const {
 #ifdef __EMSCRIPTEN__
   return c2d_measure(contextId_,s.c_str());
 #else
-  (void)s; return 0;
+  if (const Font* font=uiFont(state_.fontFamily)) return font->measure(s,state_.fontSize);
+  return static_cast<float>(s.size())*6.f*(state_.fontSize/8.f);
 #endif
 }
 void Canvas::drawCanvas(const Canvas&s,float a,float b) {
@@ -334,11 +743,14 @@ void Canvas::drawCanvas(const Canvas&s,float a,float b,float c,float d) {
   c2d_draw(contextId_,s.contextId_,a,b,c,d,1);
 #else
   if (c <= 0 || d <= 0) return;
-  for (int y = std::max(0, static_cast<int>(std::floor(b))); y < std::min(height_, static_cast<int>(std::ceil(b + d))); ++y)
-    for (int x = std::max(0, static_cast<int>(std::floor(a))); x < std::min(width_, static_cast<int>(std::ceil(a + c))); ++x) {
-      const int sx = std::clamp(static_cast<int>((x - a) * s.width_ / c), 0, s.width_ - 1);
-      const int sy = std::clamp(static_cast<int>((y - b) * s.height_ / d), 0, s.height_ - 1);
-      blendPixel(x, y, s.pixels_[static_cast<size_t>(sy) * s.width_ + sx]);
+  const auto topLeft=mapPoint(a,b), bottomRight=mapPoint(a+c,b+d);
+  const float dx0=std::min(topLeft.first,bottomRight.first), dx1=std::max(topLeft.first,bottomRight.first);
+  const float dy0=std::min(topLeft.second,bottomRight.second), dy1=std::max(topLeft.second,bottomRight.second);
+  for (int y = std::max(0, static_cast<int>(std::floor(dy0))); y < std::min(height_, static_cast<int>(std::ceil(dy1))); ++y)
+    for (int x = std::max(0, static_cast<int>(std::floor(dx0))); x < std::min(width_, static_cast<int>(std::ceil(dx1))); ++x) {
+      const int sx = std::clamp(static_cast<int>((x + 0.5f - dx0) * s.width_ / std::max(1e-3f, dx1-dx0)), 0, s.width_ - 1);
+      const int sy = std::clamp(static_cast<int>((y + 0.5f - dy0) * s.height_ / std::max(1e-3f, dy1-dy0)), 0, s.height_ - 1);
+      paint(x, y, s.pixels_[static_cast<size_t>(sy) * s.width_ + sx], state_.alpha * clipAt(x,y));
     }
 #endif
 }
@@ -365,7 +777,10 @@ bool Canvas::savePPM(const std::string& path)const {
   (void)path; return true;
 #else
   std::ofstream f(path,std::ios::binary); if(!f)return false;
-  f<<"P6\n"<<width_<<" "<<height_<<"\n255\n"; for(auto&p:pixels_){f.put(p.r);f.put(p.g);f.put(p.b);} return !!f;
+  f<<"P6\n"<<width_<<" "<<height_<<"\n255\n";
+  for(auto&p:pixels_){ const float a=p.a/255.f;
+    f.put(static_cast<char>(std::lround(p.r*a+255*(1-a)))); f.put(static_cast<char>(std::lround(p.g*a+255*(1-a)))); f.put(static_cast<char>(std::lround(p.b*a+255*(1-a)))); }
+  return !!f;
 #endif
 }
 
@@ -381,11 +796,6 @@ bool Canvas::showWindow(const std::string& title, const std::function<void(Canva
   SDL_Texture* texture = renderer ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, width_, height_) : nullptr;
   if (!texture) { if(renderer) SDL_DestroyRenderer(renderer); if(window) SDL_DestroyWindow(window); SDL_Quit(); return false; }
   std::vector<std::uint8_t> rgba(static_cast<size_t>(width_) * height_ * 4);
-  for (size_t i=0;i<pixels_.size();++i) {
-    const Color& p=pixels_[i]; const float a=p.a/255.f;
-    rgba[i*4]=static_cast<std::uint8_t>(p.r*a+255*(1-a)); rgba[i*4+1]=static_cast<std::uint8_t>(p.g*a+255*(1-a));
-    rgba[i*4+2]=static_cast<std::uint8_t>(p.b*a+255*(1-a)); rgba[i*4+3]=255;
-  }
   const Uint64 start=SDL_GetPerformanceCounter(), frequency=SDL_GetPerformanceFrequency();
   bool running=true; while(running) { const Uint64 frameStart=SDL_GetPerformanceCounter(); SDL_Event event; while(SDL_PollEvent(&event)) if(event.type==SDL_QUIT) running=false;
     if (drawFrame) drawFrame(*this, static_cast<float>(SDL_GetPerformanceCounter()-start)/frequency);
@@ -403,16 +813,98 @@ bool Canvas::showWindow(const std::string& title, const std::function<void(Canva
 #endif
 }
 #ifndef __EMSCRIPTEN__
-std::pair<float,float> Canvas::mapPoint(float x,float y) const { return {matrix_[0]*x+matrix_[2]*y+matrix_[4], matrix_[1]*x+matrix_[3]*y+matrix_[5]}; }
-void Canvas::blendPixel(int x,int y,Color c) {
-  if(x<0||y<0||x>=width_||y>=height_) return;
-  Color& d=pixels_[size_t(y)*width_+x];
-  const float sa=c.a/255.f, da=d.a/255.f, oa=sa+da*(1-sa);
-  if(oa==0) { d=Color{0,0,0,0}; return; }
-  d=Color{static_cast<std::uint8_t>((c.r*sa+d.r*da*(1-sa))/oa),
-          static_cast<std::uint8_t>((c.g*sa+d.g*da*(1-sa))/oa),
-          static_cast<std::uint8_t>((c.b*sa+d.b*da*(1-sa))/oa),
-          static_cast<std::uint8_t>(oa*255)};
+std::pair<float,float> Canvas::mapPoint(float x,float y) const { const auto& m=state_.matrix; return {m[0]*x+m[2]*y+m[4], m[1]*x+m[3]*y+m[5]}; }
+float Canvas::clipAt(int x,int y) const {
+  const ClipMask* c=state_.clip.get(); if (!c) return 1.f;
+  if (x<c->x0||x>=c->x1||y<c->y0||y>=c->y1) return 0.f;
+  return c->alpha[static_cast<size_t>(y-c->y0)*(c->x1-c->x0)+(x-c->x0)]*(1.f/255.f);
 }
-void Canvas::drawLine(float a,float b,float c,float d){int n=std::max(1,(int)std::ceil(std::max(std::abs(c-a),std::abs(d-b))));for(int i=0;i<=n;i++){float t=float(i)/n;int x=std::lround(a+(c-a)*t),y=std::lround(b+(d-b)*t);for(int yy=y-lineWidth_/2;yy<=y+lineWidth_/2;yy++)for(int xx=x-lineWidth_/2;xx<=x+lineWidth_/2;xx++)blendPixel(xx,yy,stroke_);}}
+void Canvas::paint(int x,int y,Color c,float coverage) {
+  if(x<0||y<0||x>=width_||y>=height_) return;
+  const float sa=std::clamp(coverage,0.f,1.f)*(c.a/255.f);
+  if (sa<=0.0005f) return;
+  Color& d=pixels_[size_t(y)*width_+x];
+  const float da=d.a/255.f, oa=sa+da*(1-sa);
+  if(oa<=0) { d=Color{0,0,0,0}; return; }
+  d=Color{static_cast<std::uint8_t>(std::lround((c.r*sa+d.r*da*(1-sa))/oa)),
+          static_cast<std::uint8_t>(std::lround((c.g*sa+d.g*da*(1-sa))/oa)),
+          static_cast<std::uint8_t>(std::lround((c.b*sa+d.b*da*(1-sa))/oa)),
+          static_cast<std::uint8_t>(std::lround(oa*255))};
+}
+void Canvas::blendPixel(int x,int y,Color c) { paint(x,y,c,1.f); }
+void Canvas::fillDevice(const Path2D& path, bool evenOdd, Color color) {
+  if (color.a==0 || state_.alpha<=0 || path.segments().empty()) return;
+  flatten(path, state_.matrix, matrixScale(state_.matrix), gFlat);
+  scanFill(gFlat, evenOdd, width_, height_, [&](int x,int y,float cov){ paint(x,y,color,cov*state_.alpha*clipAt(x,y)); });
+}
+void Canvas::strokeDevice(const Path2D& path) {
+  if (state_.stroke.a==0 || state_.alpha<=0 || state_.lineWidth<=0 || path.segments().empty()) return;
+  const float scale=matrixScale(state_.matrix);
+  flatten(path, Matrix{1,0,0,1,0,0}, scale, gFlat);
+  const Poly* source=&gFlat;
+  if (!state_.dash.empty()) { applyDash(gFlat, state_.dash, state_.dashOffset, gDash); source=&gDash; }
+  strokeOutline(*source, state_.lineWidth/2, state_.lineCap, state_.lineJoin, state_.miterLimit, scale, gOutline);
+  transformPoly(gOutline, state_.matrix, gDevice);
+  const Color color=state_.stroke;
+  scanFill(gDevice, false, width_, height_, [&](int x,int y,float cov){ paint(x,y,color,cov*state_.alpha*clipAt(x,y)); });
+}
+// The system face for each generic family, loaded once on first use. A missing
+// face falls back to the 5x7 bitmap below, which has no descenders.
+static const Font* uiFont(unsigned char family) {
+  struct Face { Font font; bool tried=false; };
+  static Face faces[3];
+  if (family>2) family=0;
+  Face& face=faces[family];
+  if (!face.tried) {
+    face.tried=true;
+    static const std::vector<std::string> kPreferred[3]={
+      {"Helvetica","Arial","Verdana","DejaVuSans","LiberationSans-Regular"},
+      {"Georgia","Times New Roman","Times","DejaVuSerif","LiberationSerif-Regular"},
+      {"Menlo","Courier New","DejaVuSansMono","LiberationMono-Regular"},
+    };
+    std::string path;
+    if (Font::findSystemFont(kPreferred[family],path)) face.font.loadFromFile(path);
+  }
+  return face.font.valid() ? &face.font : nullptr;
+}
+
+void Canvas::glyphs(const std::string& text, float x, float y, float maxWidth, Color color) {
+  if (text.empty() || color.a==0) return;
+  if (const Font* font=uiFont(state_.fontFamily)) {
+    const float size=state_.fontSize, width=font->measure(text,size);
+    const float squeeze=(maxWidth>0 && width>maxWidth && width>0) ? maxWidth/width : 1.f;
+    const float ascent=font->ascent(size), descent=font->descent(size);
+    const float penX=x-(state_.textAlign==1 ? width*squeeze/2 : state_.textAlign==2 ? width*squeeze : 0.f);
+    const float baseline=y+(state_.textBaseline==0 ? ascent : state_.textBaseline==1 ? (ascent+descent)/2
+                          : state_.textBaseline==2 ? descent : 0.f);
+    Path2D shaped;
+    font->appendText(shaped,text,penX,baseline,size);
+    if (squeeze!=1.f)
+      for (Path2D::Segment& s : shaped.segments()) {
+        const int pairs = s.command==Path2D::Command::Move||s.command==Path2D::Command::Line ? 1
+                        : s.command==Path2D::Command::Quadratic ? 2
+                        : s.command==Path2D::Command::Bezier ? 3 : 0;
+        for (int k=0;k<pairs;++k) s.v[k*2]=penX+(s.v[k*2]-penX)*squeeze;
+      }
+    fillDevice(shaped,false,color);
+    return;
+  }
+  const float unit=state_.fontSize/8.f;
+  float advance=6*unit, height=7*unit;
+  const float full=static_cast<float>(text.size())*advance;
+  float squeeze=1.f;
+  if (maxWidth>0 && full>maxWidth) squeeze=maxWidth/full;
+  float penX = x - (state_.textAlign==1 ? full*squeeze/2 : state_.textAlign==2 ? full*squeeze : 0.f);
+  const float penY = y - (state_.textBaseline==0 ? 0.f : state_.textBaseline==1 ? height/2 : height);
+  Path2D glyph;
+  for (unsigned char ch : text) {
+    if (ch>=32 && ch<127) {
+      const unsigned char* columns=kFont[ch-32];
+      for (int c=0;c<5;++c) for (int r=0;r<7;++r)
+        if (columns[c]>>r & 1) glyph.rect(penX+c*unit*squeeze, penY+r*unit, unit*squeeze+0.01f, unit+0.01f);
+    }
+    penX += advance*squeeze;
+  }
+  fillDevice(glyph, false, color);
+}
 #endif

@@ -1,3 +1,0 @@
-/Users/darren/cpp_canvas/build/CMakeFiles/canvas_demo.dir
-/Users/darren/cpp_canvas/build/CMakeFiles/edit_cache.dir
-/Users/darren/cpp_canvas/build/CMakeFiles/rebuild_cache.dir

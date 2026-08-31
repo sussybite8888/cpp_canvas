@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(canvas_demo main.cpp canvas.cpp svg.cpp)
+add_executable(canvas_demo main.cpp canvas.cpp svg.cpp font.cpp window.cpp)
 target_include_directories(canvas_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(EMSCRIPTEN)

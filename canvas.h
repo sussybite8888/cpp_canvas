@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,10 @@ public:
     void ellipse(float x, float y, float radiusX, float radiusY, float rotation, float startAngle, float endAngle, bool counterClockwise = false);
     void rect(float x, float y, float width, float height); void roundRect(float x, float y, float width, float height, float radius);
     void addPath(const Path2D& other);
+    void clear() { segments_.clear(); }
+    bool empty() const { return segments_.empty(); }
     const std::vector<Segment>& segments() const { return segments_; }
+    std::vector<Segment>& segments() { return segments_; }
 private: std::vector<Segment> segments_;
 };
 
@@ -83,9 +87,23 @@ private:
     int width_, height_, contextId_ = -1; bool virtual_ = false; std::string elementId_;
     Color fill_{0, 0, 0}, stroke_{0, 0, 0}; float lineWidth_ = 1.0f; Path2D currentPath_; std::vector<Color> pixels_;
 #ifndef __EMSCRIPTEN__
-    std::array<float, 6> matrix_{1,0,0,1,0,0};
-    std::vector<std::array<float, 6>> matrixStack_;
-    void blendPixel(int x, int y, Color color); void drawLine(float ax, float ay, float bx, float by);
+    // Software backend state. Everything the browser context tracks per save()
+    // lives here; clip is a shared coverage mask so restore() is a pointer swap.
+    struct ClipMask { int x0 = 0, y0 = 0, x1 = 0, y1 = 0; std::vector<std::uint8_t> alpha; };
+    struct State {
+        std::array<float, 6> matrix{1,0,0,1,0,0};
+        Color fill{0,0,0}, stroke{0,0,0};
+        float lineWidth = 1, alpha = 1, miterLimit = 10, dashOffset = 0, fontSize = 10;
+        unsigned char lineCap = 0, lineJoin = 0, textAlign = 0, textBaseline = 3, fontFamily = 0;
+        std::vector<float> dash;
+        std::shared_ptr<const ClipMask> clip;
+    };
+    State state_; std::vector<State> stack_;
+    void blendPixel(int x, int y, Color color); void paint(int x, int y, Color color, float coverage);
+    float clipAt(int x, int y) const;
     std::pair<float,float> mapPoint(float x, float y) const;
+    void fillDevice(const Path2D& path, bool evenOdd, Color color);
+    void strokeDevice(const Path2D& path);
+    void glyphs(const std::string& text, float x, float y, float maxWidth, Color color);
 #endif
 };
