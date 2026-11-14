@@ -6,6 +6,12 @@
 #include <string>
 #include <vector>
 
+// One SVG path `d` attribute, parsed exactly as a <path> in a document is --
+// relative commands resolved, arcs turned into canvas ellipses. For code that
+// draws an authored outline itself rather than through a document: parse it
+// once, keep the Path2D, and fill or stroke it under whatever transform.
+Path2D svgPathData(const std::string& d);
+
 // A small SVG scene compiler. A document is parsed once into a retained tree of
 // baked Path2D geometry; render() evaluates SVG animations at timeSeconds and
 // emits only Canvas/Path2D commands, never asking the browser to render SVG.
@@ -24,14 +30,21 @@ public:
     float viewBoxWidth() const { return viewW_; }
     float viewBoxHeight() const { return viewH_; }
     bool empty() const;
+    /// True when any node in the document carries a SMIL timeline, so its ink
+    /// depends on `timeSeconds`. False means every frame of this document is
+    /// the same picture -- which is what makes rasterising it once and reusing
+    /// the pixels a legal substitution rather than a guess about the data.
+    bool animated() const;
 
     // Draws into the document's own width x height viewport at the origin, with
     // the viewBox mapped onto it exactly as an SVG viewer would.
     bool render(Canvas& canvas, float timeSeconds = 0.0f) const;
     // Maps the viewBox into an arbitrary target box, honouring preserveAspectRatio.
     // Callers that scale by width() alone get every viewBox document wrong.
+    // The box form takes timeSeconds explicitly: defaulting it would make every
+    // five-argument call ambiguous against the square form below.
     bool renderFitted(Canvas& canvas, float x, float y, float size, float timeSeconds = 0.0f) const;
-    bool renderFitted(Canvas& canvas, float x, float y, float width, float height, float timeSeconds = 0.0f) const;
+    bool renderFitted(Canvas& canvas, float x, float y, float width, float height, float timeSeconds) const;
 
     const std::vector<std::string>& warnings() const { return warnings_; }
 

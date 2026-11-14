@@ -2,11 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
     <title>C++ Canvas demo</title>
     <style>
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #e2e8f0; }
-      canvas { max-width: calc(100vw - 32px); height: auto; box-shadow: 0 12px 40px #0f172a33; }
+      /* Window owns the element: it fills the viewport and the program draws
+         in its design space, scaled to cover it. */
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0f172a; }
+      canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
     </style>
   </head>
   <body>

@@ -1,7 +1,10 @@
 # Build trees
 build/
-build-web/
+build-*/
 cmake-build-*/
+
+# Prebuilt Skia for the CPP_CANVAS_SKIA build
+skia-wasm/
 
 # Demo output
 canvas-demo.ppm
