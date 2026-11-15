@@ -54,6 +54,11 @@ executed. A canvas is flushed by `Window::present()`, `flush()`,
 browser, anything still buffered is also flushed automatically before the next
 paint.
 
+In the browser, every canvas records into one shared buffer, as florr.io_clone's
+backend did. It holds one canvas's calls at a time: when another canvas starts
+drawing, the one holding the buffer is flushed first. A canvas therefore costs
+no buffer memory of its own, however many small canvases an app bakes.
+
 Culling walks the recording backwards and keeps a one-bit-per-pixel map of
 what later draws are certain to overwrite. A draw whose whole bounding box is
 already covered is dropped before it costs anything. Its state changes still
@@ -132,9 +137,14 @@ buffer can be reused straight away.
   - `strokeText` draws outlines.
   - `canvasRegisterFont()` makes a font file usable on every backend.
 - **Images**
-  - `drawCanvas` and `drawImage` work under any transform, with bilinear
-    smoothing ("low"), area-averaged minification ("medium" or "high"), or
-    nearest-neighbour sampling.
+  - `drawImage` works under any transform, with bilinear smoothing ("low"),
+    area-averaged minification ("medium" or "high"), or nearest-neighbour
+    sampling. With a source rectangle, filtering may read neighbouring pixels
+    of the source image, as the spec says.
+  - `drawCanvas` works under any transform too. Natively, a canvas drawn
+    scaled takes the nearest texel under each pixel, as florr.io_clone's copy
+    does, whatever `imageSmoothingEnabled` says. In the browser it is smoothed
+    as the context says.
   - `drawImage` also has a nine-argument (source-rectangle) form.
   - Image pyramids are supported.
   - `putImageData` takes a dirty rectangle and replaces pixels.
@@ -160,9 +170,6 @@ These changes bring the native backend in line with the HTML spec and Chrome:
 - Setters ignore invalid values instead of clamping them. This covers
   `globalAlpha` outside [0, 1], a line width ≤ 0, a negative or non-finite
   dash, and a bad colour, font or filter string.
-- `drawCanvas` smooths when scaled (`setImageSmoothingEnabled(false)` for
-  nearest). With a source rectangle, filtering may read neighbouring pixels of
-  the source image, as the spec says.
 - Text baselines snap to whole device pixels, and text is kerned (except
   across spaces, as Chrome does).
 - `lineTo` after `closePath()` starts at the closed subpath's start. A lone
@@ -213,12 +220,10 @@ configurations were run interleaved, best of three each:
 | game frame under an opaque menu | 33.1 | 9.68 | 1.26 | 0.15 |
 | **total** | **360** | **93.8** | **14.8** | **13.1** |
 
-Every scene is faster than in florr.io_clone's copy, with culling on or off,
-although two of them do more work per pixel here. Scaled sprites are filtered
-bilinearly, as Chrome does, where florr's copy samples the nearest texel, which
-aliases (`setImageSmoothingEnabled(false)` gives the nearest path here too).
-Rows of the jagged polyline that are too busy for exact coverage take 8
-samples per pixel; florr's copy takes 5.
+Every scene is faster than in florr.io_clone's copy, with culling on or off.
+Scaled sprites are sampled the way florr's copy samples them, one texel per
+pixel. Rows of the jagged polyline that are too busy for exact coverage take 8
+samples per pixel here, where florr's copy takes 5.
 
 Where the time went:
 
@@ -231,8 +236,10 @@ Where the time went:
   line to the next instead of sorting every line.
 - Culling checks a draw against the largest rectangle known to be covered
   before it walks the bitmap.
-- A scaled image is sampled and blended in one pass. Four opaque texels are
-  filtered two channels per multiply, and four transparent ones are skipped.
+- A scaled sprite is sampled and blended in one pass: a transparent texel is
+  skipped and an opaque one copied. A filtered image is one pass too: four
+  opaque texels are filtered two channels per multiply, and four transparent
+  ones are skipped.
 - Blending uses integer arithmetic. When a fractional global alpha is
   involved it uses 16 bits, so stacked translucent layers do not drift.
 - Pixel-aligned rectangle clips need no mask.

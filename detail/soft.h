@@ -244,16 +244,44 @@ struct Shader {
         return true;
     }
 
-    // drawImage's common case -- upright, one bilinear tap, clamped at the
-    // image's edge, untinted -- sampled and blended in one pass, with no row
-    // buffer between. Texels are straight alpha: a footprint of four opaque
-    // texels filters as it is, two channels per multiply; four transparent
-    // ones are skipped outright; only the mixed footprints along a sprite's
-    // rim premultiply. Pixel for pixel the same as shade() then blending.
+    // drawImage's common case -- upright, one tap (bilinear or nearest),
+    // clamped at the image's edge, untinted -- sampled and blended in one
+    // pass, with no row buffer between. Pixel for pixel the same as shade()
+    // then blending.
     bool fusesUpright() const {
-        return kind == Image && !exact && grid == 1 && bilinear && clampOutside && !repeatX && !repeatY && !tinted && inv[1] == 0 && inv[2] == 0;
+        return kind == Image && !exact && grid == 1 && clampOutside && !repeatX && !repeatY && !tinted && inv[1] == 0 && inv[2] == 0;
     }
     void blendUpright(Color* row, int x0, int y, int n, std::uint32_t k8) const {
+        if (bilinear) blendBilinear(row, x0, y, n, k8);
+        else blendNearest(row, x0, y, n, k8);
+    }
+    // One texel per pixel, the one under the pixel's centre: a transparent
+    // texel is skipped, an opaque one at full alpha is copied, and only the
+    // rest blend.
+    void blendNearest(Color* row, int x0, int y, int n, std::uint32_t k8) const {
+        const int lo = static_cast<int>(std::floor(u0)), hi = std::max(lo + 1, static_cast<int>(std::ceil(u1)));
+        const int loV = static_cast<int>(std::floor(v0)), hiV = std::max(loV + 1, static_cast<int>(std::ceil(v1)));
+        const int j = std::clamp(static_cast<int>(std::floor(inv[3] * (y + 0.5f) + inv[5])), loV, hiV - 1);
+        const std::uint8_t* src = img + static_cast<std::size_t>(j) * static_cast<std::size_t>(iw) * 4;
+        const float du = inv[0];
+        float u = inv[0] * (x0 + 0.5f) + inv[4];
+        for (int k = 0; k < n; ++k, u += du) {
+            const std::uint8_t* p = src + std::clamp(static_cast<int>(std::floor(u)), lo, hi - 1) * 4;
+            const std::uint32_t a = p[3];
+            if (!a) continue;
+            Color& d = row[x0 + k];
+            if ((a & k8) == 255) { std::memcpy(&d, p, 4); continue; }
+            std::uint32_t r = p[0], g = p[1], b = p[2];
+            if (a != 255) { r = div255(r * a); g = div255(g * a); b = div255(b * a); }
+            if (k8 == 255) blendPremulOver(d, r, g, b, a);
+            else blendPremulOver(d, div255(r * k8), div255(g * k8), div255(b * k8), div255(a * k8));
+        }
+    }
+    // Bilinear: texels are straight alpha, so a footprint of four opaque
+    // texels filters as it is, two channels per multiply; four transparent
+    // ones are skipped outright; only the mixed footprints along a sprite's
+    // rim premultiply.
+    void blendBilinear(Color* row, int x0, int y, int n, std::uint32_t k8) const {
         const int lo = static_cast<int>(std::floor(u0)), hi = std::max(lo + 1, static_cast<int>(std::ceil(u1)));
         const int loV = static_cast<int>(std::floor(v0)), hiV = std::max(loV + 1, static_cast<int>(std::ceil(v1)));
         const float v = inv[3] * (y + 0.5f) + inv[5];
@@ -1463,8 +1491,11 @@ inline void Canvas::Soft::execImage(const Op& op, const Style& s) {
     shader.tinted = op.tinted; shader.tint = op.tint;
     if (!invert(full, shader.inv)) return;
     const float shrink = std::max(std::hypot(shader.inv[0], shader.inv[1]), std::hypot(shader.inv[2], shader.inv[3]));
-    shader.bilinear = s.smoothing;
-    shader.grid = s.smoothing && s.smoothingQuality > 0 ? std::clamp(static_cast<int>(std::ceil(shrink - 0.01f)), 1, 4) : 1;
+    // A canvas (a sprite) drawn scaled takes the texel under each pixel's
+    // centre, unfiltered, as florr.io_clone's copy does -- whatever
+    // imageSmoothingEnabled says. Image data and patterns still filter.
+    shader.bilinear = s.smoothing && !op.src;
+    shader.grid = shader.bilinear && s.smoothingQuality > 0 ? std::clamp(static_cast<int>(std::ceil(shrink - 0.01f)), 1, 4) : 1;
     // One texel to one pixel on whole-pixel positions: a copy, no filtering.
     const auto integral = [](float v) { return std::abs(v - std::round(v)) < 1e-4f; };
     if (full[1] == 0 && full[2] == 0 && std::abs(full[0] - 1) < 1e-6f && std::abs(full[3] - 1) < 1e-6f && integral(full[4]) && integral(full[5])) {
@@ -1480,7 +1511,7 @@ inline void Canvas::Soft::execImage(const Op& op, const Style& s) {
     if (deviceRect(op.m, dx, dy, dw, dh, X0, Y0, X1, Y1)) {
         const IBox shape = toIBox(Box{X0, Y0, X1, Y1});
         // A filtered image costs several times a fill per pixel.
-        const int cost = shader.exact ? 1 : 4;
+        const int cost = shader.exact ? 1 : shader.bilinear ? 4 : 2;
         paint(styled, shader, shape, nullptr, [&](auto& sink, const IBox& limit) { produceRect(X0, Y0, X1, Y1, limit, sink, cost); });
         return;
     }

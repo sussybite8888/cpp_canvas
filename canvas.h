@@ -316,6 +316,10 @@ public:
     void fillText(const std::string& text, float x, float y, float maxWidth = -1); void strokeText(const std::string& text, float x, float y, float maxWidth = -1);
     float measureText(const std::string& text) const;
     TextMetrics measureTextMetrics(const std::string& text) const;
+    // Natively a canvas drawn scaled takes the nearest texel under each
+    // pixel, whatever imageSmoothingEnabled says (florr.io_clone's sprite
+    // path); the browser smooths it as the context says. drawImage of pixel
+    // data filters on both.
     void drawCanvas(const Canvas& source, float dx, float dy); void drawCanvas(const Canvas& source, float dx, float dy, float dw, float dh);
     // The nine-argument drawImage form.
     void drawCanvas(const Canvas& source, float sx, float sy, float sw, float sh,
@@ -443,7 +447,7 @@ private:
     mutable bool pageSeamMoved_ = false;
     bool pathUniform_ = true;
     bool paintCachedPath(int action, bool evenOdd);
-    // Per-canvas op buffer and the culling metadata for it.
+    // What this canvas keeps between batches of the shared op buffer.
     std::unique_ptr<WebOps> ops_;
     int layerDepth_ = 0;
     // Culling: what the next paint op covers and whether it is an occluder.

@@ -5,14 +5,20 @@
 // Flushing one canvas.
 // ===========================================================================
 void Canvas::flush() {
-  WebOps& b = *ops_;
+  OpBuffer& b = opBuffer();
   // Whoever recorded a draw FROM this canvas reads it as it is now.
   beforeWrite();
-  if (b.count == 0 || contextId_ < 0) {
+  if (b.owner != this || b.count == 0) {
     pendingCanvases().erase(this);
     return;
   }
-  if (cullingEnabled_) gFrameStats.culled += cullBuffer(b, width_, height_, b.pathGen);
+  if (contextId_ < 0) {
+    // Recorded after a move took its context: there is nowhere to send it.
+    discardOps(b);
+    pendingCanvases().erase(this);
+    return;
+  }
+  if (cullingEnabled_) gFrameStats.culled += cullBuffer(b, width_, height_, ops_->pathGen);
   const int count = b.count;
   b.count = 0;
   pendingCanvases().erase(this);
@@ -31,10 +37,7 @@ void Canvas::flush() {
 }
 void Canvas::setCulling(bool enabled) { cullingEnabled_ = enabled; }
 
-int canvasOpsEmitted() {
-  int pending = 0;
-  return gFrameStats.ops + pending;
-}
+int canvasOpsEmitted() { return gFrameStats.ops + opBuffer().count; }
 const int* canvasOpTypeCounts() { return gOpTypeCounts; }
 CanvasFrameStats canvasTakeFrameStats() {
   const CanvasFrameStats taken = gFrameStats;
@@ -112,8 +115,8 @@ void Canvas::sync(unsigned need) const {
   if ((todo & kDashBit) && w.dash != a.dash) {
     // The array rides in the path arena: no flush needed for it any more.
     a.dash = w.dash;
-    OpSlot* r = pushRef(*this, BUF, 26, static_cast<std::int32_t>(BUF.paths.size()), {static_cast<float>(a.dash.size())});
-    (void)r;
+    OpSlot* r = pushRef(*this, BUF, 26, 0, {static_cast<float>(a.dash.size())});
+    r[11].i = static_cast<std::int32_t>(BUF.paths.size());
     BUF.paths.insert(BUF.paths.end(), a.dash.begin(), a.dash.end());
   }
   if ((todo & kDashOffsetBit) && w.dashOffset != a.dashOffset) { a.dashOffset = w.dashOffset; OP(18, {a.dashOffset}); }
@@ -254,7 +257,7 @@ void noteBlinkFullTurn(const CanvasPageFrame& r) {
            "filled full circles are sent starting at angle 0, which it always draws whole.");
 }
 // A segment as the record that adds it to the page's current path.
-void emitSegment(const Canvas& c, Canvas::WebOps& b, const Path2D::Segment& g) {
+void emitSegment(const Canvas& c, OpBuffer& b, const Path2D::Segment& g) {
   const float* v = g.v;
   const float ccw = g.counterClockwise ? 1.f : 0.f;
   switch (g.command) {
@@ -271,7 +274,7 @@ void emitSegment(const Canvas& c, Canvas::WebOps& b, const Path2D::Segment& g) {
   }
   OpMeta& m = lastMeta(b);
   m.kind = 2;
-  m.pathGen = b.pathGen;
+  m.pathGen = b.state->pathGen;
 }
 }  // namespace
 void Canvas::emitSegmentAt(const std::array<double, 6>& m, const Path2D::Segment& g, bool loose) const {
@@ -359,7 +362,7 @@ bool pathAlreadySent(const Path2D& path) {
 }
 constexpr std::size_t kMaxInlinePathSegments = 8;
 // A path with its geometry in the buffer's arena (record 53).
-OpSlot* pushPathRecord(const Canvas& c, Canvas::WebOps& b, std::int32_t key, const Path2D& path, int action, bool evenOdd) {
+OpSlot* pushPathRecord(const Canvas& c, OpBuffer& b, std::int32_t key, const Path2D& path, int action, bool evenOdd) {
   OpSlot* r = opRecord(c, b, 53);
   const std::size_t at = b.paths.size();
   b.paths.reserve(at + path.segments().size() * 10);
@@ -376,7 +379,7 @@ OpSlot* pushPathRecord(const Canvas& c, Canvas::WebOps& b, std::int32_t key, con
   if (key) lastMeta(b).keepsPath = true;
   return r;
 }
-void emitPath(const Canvas& c, Canvas::WebOps& b, const Path2D& path, int action, bool evenOdd) {
+void emitPath(const Canvas& c, OpBuffer& b, const Path2D& path, int action, bool evenOdd) {
   const std::uint32_t key = path.cacheKey();
   if (pathAlreadySent(path)) { pushRef(c, b, 50, static_cast<std::int32_t>(key), {static_cast<float>(action), evenOdd ? 1.f : 0.f}); return; }
   pushPathRecord(c, b, static_cast<std::int32_t>(key), path, action, evenOdd);
@@ -405,10 +408,10 @@ void Canvas::pathSegmentAdded() {
   pagePathDirty_ = true;
 }
 void Canvas::sendHeldPath(std::size_t count, bool fillOnly) const {
-  ++BUF.pathGen;
+  ++ops_->pathGen;
   OP(33, {});
   lastMeta(BUF).kind = 2;
-  lastMeta(BUF).pathGen = BUF.pathGen;
+  lastMeta(BUF).pathGen = ops_->pathGen;
   pageSeamMoved_ = false;
   const std::vector<Path2D::Segment>& segs = currentPath_.segments();
   for (std::size_t i = 0; i < count; ++i) emitSegmentAt(pathMatrix_, segs[i], fillOnly && looseTurn(segs, i));
@@ -420,10 +423,10 @@ void Canvas::preparePagePath(bool fillOnly) const {
   if (pathMode_ == PathMode::Deferred) {
     sendHeldPath(currentPath_.segments().size(), fillOnly);
   } else if (pathMode_ == PathMode::Empty && pagePathDirty_) {
-    ++BUF.pathGen;
+    ++ops_->pathGen;
     OP(33, {});
     lastMeta(BUF).kind = 2;
-    lastMeta(BUF).pathGen = BUF.pathGen;
+    lastMeta(BUF).pathGen = ops_->pathGen;
     pageSeamMoved_ = false; pagePathDirty_ = false; pagePathSegments_ = 0;
   }
 }
@@ -784,7 +787,7 @@ void Canvas::fill(const std::string& s) {
   OP(44, {}, s.c_str());
   notePaint(0, box, occ, inner);
   lastMeta(BUF).usesPagePath = true;
-  lastMeta(BUF).pathGen = BUF.pathGen;
+  lastMeta(BUF).pathGen = ops_->pathGen;
 }
 void Canvas::desaturate(const std::string& s) {
   save();
@@ -809,7 +812,7 @@ void Canvas::stroke() {
   OP(45, {});
   notePaint(1, box, false, nullptr);
   lastMeta(BUF).usesPagePath = true;
-  lastMeta(BUF).pathGen = BUF.pathGen;
+  lastMeta(BUF).pathGen = ops_->pathGen;
 }
 namespace {
 // What a clip does to the culling view of the clip: its device box narrows,
@@ -837,7 +840,7 @@ void Canvas::clip(const std::string& s) {
   preparePagePath(true);
   OP(46, {}, s.c_str());
   lastMeta(BUF).usesPagePath = true;
-  lastMeta(BUF).pathGen = BUF.pathGen;
+  lastMeta(BUF).pathGen = ops_->pathGen;
 }
 void Canvas::fill(const Path2D& p, const std::string& s) {
   sync(kFillBits);
@@ -1094,9 +1097,9 @@ void Canvas::putImageData(const std::vector<std::uint8_t>& rgba, int sw, int sh,
   dirtyH = std::min(dirtyH, sh - dirtyY);
   if (dirtyW <= 0 || dirtyH <= 0) return;
   // Only the dirty rectangle rides in the buffer.
-  OpSlot* r = pushRef(*this, BUF, 56, static_cast<std::int32_t>(BUF.bytes.size()),
+  OpSlot* r = pushRef(*this, BUF, 56, 0,
                       {static_cast<float>(dirtyW), static_cast<float>(dirtyH), static_cast<float>(dx + dirtyX), static_cast<float>(dy + dirtyY)});
-  (void)r;
+  r[11].i = static_cast<std::int32_t>(BUF.bytes.size());
   for (int row = 0; row < dirtyH; ++row) {
     const std::uint8_t* from = rgba.data() + (static_cast<std::size_t>(dirtyY + row) * sw + dirtyX) * 4;
     BUF.bytes.insert(BUF.bytes.end(), from, from + static_cast<std::size_t>(dirtyW) * 4);

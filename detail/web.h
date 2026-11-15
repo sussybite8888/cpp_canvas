@@ -5,11 +5,12 @@
 // How a call reaches the page
 // ---------------------------
 // Calls do not cross into JavaScript one at a time: each is a fixed-size
-// record in its canvas's own buffer in wasm memory, and a buffer is handed
-// over whole (c2d_flush) when it is flushed: at Window::present(), when it
-// fills, before anything reads its pixels, and before a canvas that drew FROM
-// it is flushed. Style strings are interned once and named by index; text,
-// path geometry and pixels ride in per-buffer arenas. The drawing state --
+// record in one buffer in wasm memory that all canvases share, holding one
+// canvas's calls at a time. It is handed over whole (c2d_flush) when another
+// canvas starts recording, at Window::present(), when it fills, and before
+// anything reads the pixels of the canvas holding it. Style strings are
+// interned once and named by index; text, path geometry and pixels ride in
+// the buffer's arenas. The drawing state --
 // save/restore included -- is mirrored in wasm (web_), and what the page holds
 // is tracked in applied_, so a setter costs nothing until a draw reads it.
 //
@@ -345,6 +346,8 @@ EM_JS(void, c2d_remote_release, (int id), {
 namespace {
 union OpSlot { float f; std::int32_t i; };
 constexpr int kOpSlots = 12;
+// A bound on how far a call can lag the page, not on how big a frame may be:
+// filling the buffer flushes it and carries on.
 constexpr int kOpCapacity = 16384;
 constexpr std::size_t kMaxArenaFloats = 1u << 20;
 constexpr int kNop = 61;
@@ -379,24 +382,66 @@ std::unordered_map<int, Canvas*>& liveCanvases() {
 }
 }  // namespace
 
+// What a canvas keeps of its own between batches: the generation of the
+// page's current path, which culling matches paints against.
 struct Canvas::WebOps {
-    std::vector<OpSlot> slots;
-    std::vector<OpMeta> meta;
-    int count = 0;
-    std::string text;
-    std::vector<float> paths;
-    std::vector<std::uint8_t> bytes;
     std::int32_t pathGen = 1;
-    // The paint about to be recorded: its box and occluder, set by notePaint.
-    OpMeta pending;
-    bool pendingSet = false;
-    std::vector<std::uint64_t> occlusion;
-    WebOps() { slots.resize(static_cast<std::size_t>(kOpCapacity) * kOpSlots); meta.resize(kOpCapacity); }
 };
 
 namespace {
+// The calls not yet handed to the page. There is ONE buffer, as in florr's
+// backend, and it holds one canvas's calls at a time: a canvas that records
+// while another holds it flushes that one first (claimOps), which is what
+// keeps every canvas's calls reaching the page in the order they were made.
+// Per-canvas buffers cost each canvas the whole capacity -- an app that bakes
+// hundreds of small canvases, more with every new scroll position, ran the
+// page out of memory.
+struct OpBuffer {
+    std::vector<OpSlot> slots;
+    std::vector<OpMeta> meta;
+    int count = 0;
+    // Arenas for the calls in the buffer: text, path geometry and pixels.
+    // Emptied by each flush; their capacity is kept.
+    std::string text;
+    std::vector<float> paths;
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint64_t> occlusion;  // culling scratch
+    // The canvas the calls belong to, and its own state; null when no canvas
+    // has recorded since the last owner went away.
+    const Canvas* owner = nullptr;
+    Canvas::WebOps* state = nullptr;
+    OpBuffer() { slots.resize(static_cast<std::size_t>(kOpCapacity) * kOpSlots); meta.resize(kOpCapacity); }
+};
+// Never destroyed: a Canvas outliving it at exit still has something to leave.
+OpBuffer& opBuffer() { static auto* b = new OpBuffer(); return *b; }
+
 void flushAllBuffers();
 void flushBuffer(const Canvas& c) { const_cast<Canvas&>(c).flush(); }
+
+// The buffer, holding `c`'s calls: whoever held it is flushed first.
+OpBuffer& claimOps(const Canvas& c, Canvas::WebOps& state) {
+    OpBuffer& b = opBuffer();
+    if (b.owner != &c) {
+        if (b.owner) flushBuffer(*b.owner);
+        b.owner = &c;
+        b.state = &state;
+    }
+    return b;
+}
+// Drops the buffered calls unsent.
+void discardOps(OpBuffer& b) {
+    b.count = 0;
+    b.text.clear(); b.paths.clear(); b.bytes.clear();
+}
+// `c` is going away or being moved: the buffer stops naming it. Anything it
+// still holds was flushed by the caller, or can never be (no context).
+void releaseOps(const Canvas* c) {
+    OpBuffer& b = opBuffer();
+    if (b.owner != c) return;
+    discardOps(b);
+    b.owner = nullptr;
+    b.state = nullptr;
+}
 
 // Every canvas with something buffered, for canvasFlushOps.
 std::unordered_set<const Canvas*>& pendingCanvases() {
@@ -426,7 +471,7 @@ std::int32_t internStyle(const char* text) {
 }  // namespace
 
 // The record for one call in `c`'s buffer, opcode written.
-static OpSlot* opRecord(const Canvas& c, Canvas::WebOps& b, int code);
+static OpSlot* opRecord(const Canvas& c, OpBuffer& b, int code);
 
 // ===========================================================================
 // Canvas internals that need the buffer.
@@ -583,7 +628,9 @@ std::string css(Color c) {
 }
 }  // namespace
 
-static OpSlot* opRecord(const Canvas& c, Canvas::WebOps& b, int code) {
+static OpSlot* opRecord(const Canvas& c, OpBuffer& b, int code) {
+  // A full buffer is flushed and `c` keeps it. Anything a caller puts in an
+  // arena is placed after this, so its offset is into the arena as it is now.
   if (b.count >= kOpCapacity || b.paths.size() >= kMaxArenaFloats || b.bytes.size() >= (32u << 20)) flushBuffer(c);
   if (b.count == 0) {
     pendingCanvases().insert(&c);
@@ -597,15 +644,15 @@ static OpSlot* opRecord(const Canvas& c, Canvas::WebOps& b, int code) {
   for (int i = 1; i < kOpSlots; ++i) r[i].i = 0;
   return r;
 }
-#define BUF (*ops_)
-static void push(const Canvas& c, Canvas::WebOps& b, int code, std::initializer_list<float> args, const char* text = "") {
+#define BUF (claimOps(*this, *ops_))
+static void push(const Canvas& c, OpBuffer& b, int code, std::initializer_list<float> args, const char* text = "") {
   const std::int32_t style = internStyle(text);
   OpSlot* r = opRecord(c, b, code);
   int i = 1;
   for (float a : args) r[i++].f = a;
   r[11].i = style;
 }
-static OpSlot* pushRef(const Canvas& c, Canvas::WebOps& b, int code, std::int32_t ref, std::initializer_list<float> args) {
+static OpSlot* pushRef(const Canvas& c, OpBuffer& b, int code, std::int32_t ref, std::initializer_list<float> args) {
   OpSlot* r = opRecord(c, b, code);
   int i = 1;
   for (float a : args) r[i++].f = a;
@@ -615,7 +662,7 @@ static OpSlot* pushRef(const Canvas& c, Canvas::WebOps& b, int code, std::int32_
 #define OP(code, ...) push(*this, BUF, code, __VA_ARGS__)
 
 // The meta of the record just written.
-static OpMeta& lastMeta(Canvas::WebOps& b) { return b.meta[static_cast<std::size_t>(b.count - 1)]; }
+static OpMeta& lastMeta(OpBuffer& b) { return b.meta[static_cast<std::size_t>(b.count - 1)]; }
 
 // ===========================================================================
 // Culling.
@@ -649,7 +696,7 @@ void markBox(std::vector<std::uint64_t>& occ, int w, int h, int x0, int y0, int 
   }
 }
 // Walks a buffer backwards and turns invisible paints into no-ops.
-int cullBuffer(Canvas::WebOps& b, int w, int h, std::int32_t currentGen) {
+int cullBuffer(OpBuffer& b, int w, int h, std::int32_t currentGen) {
   if (b.count < 2) return 0;
   bool any = false;
   int culled = 0;
@@ -755,6 +802,7 @@ Canvas::Canvas(Canvas&& o) noexcept
   // Everything that names the old object by address goes first.
   o.flush();
   o.dropDependencies();
+  releaseOps(&o);
   o.contextId_ = -1;
   if (contextId_ >= 0) liveCanvases()[contextId_] = this;
   web_ = std::move(o.web_); webStack_ = std::move(o.webStack_);
@@ -769,8 +817,10 @@ Canvas::Canvas(Canvas&& o) noexcept
 Canvas& Canvas::operator=(Canvas&& o) noexcept {
   if (this == &o) return *this;
   if (contextId_ >= 0) { flush(); dropDependencies(); c2d_destroy(contextId_); liveCanvases().erase(contextId_); }
+  releaseOps(this);
   o.flush();
   o.dropDependencies();
+  releaseOps(&o);
   width_ = o.width_; height_ = o.height_; contextId_ = o.contextId_; virtual_ = o.virtual_;
   elementId_ = std::move(o.elementId_); fill_ = o.fill_; stroke_ = o.stroke_; lineWidth_ = o.lineWidth_;
   currentPath_ = std::move(o.currentPath_); o.contextId_ = -1; tint_ = o.tint_; cullingEnabled_ = o.cullingEnabled_;
@@ -793,6 +843,7 @@ Canvas::~Canvas() {
     c2d_destroy(contextId_);
     liveCanvases().erase(contextId_);
   }
+  releaseOps(this);
   pendingCanvases().erase(this);
 }
 void Canvas::present(const std::string& id) {
