@@ -437,17 +437,67 @@ public:
         static const std::string* intern(const std::string& s);
         const std::string* p_;
     };
+    // A value a state holds that can take any of many values (a CSS colour,
+    // a font, a dash array): shared by count between the states save()
+    // copies, so a save copies a pointer. Read-only; assigning another value
+    // takes one of the few last made, or makes it.
+    template <class T> class WebShared {
+        struct Box { T value; int refs; };
+    public:
+        WebShared() : p_(none()) { ++p_->refs; }
+        WebShared(const T& v) : p_(make(v)) {}
+        WebShared(const char* s) : p_(make(T(s))) {}
+        WebShared(const WebShared& o) noexcept : p_(o.p_) { ++p_->refs; }
+        WebShared& operator=(const WebShared& o) noexcept { ++o.p_->refs; drop(p_); p_ = o.p_; return *this; }
+        WebShared& operator=(const T& v) { if (!(p_->value == v)) { Box* n = make(v); drop(p_); p_ = n; } return *this; }
+        ~WebShared() { drop(p_); }
+        friend void swap(WebShared& a, WebShared& b) noexcept { Box* t = a.p_; a.p_ = b.p_; b.p_ = t; }
+        void clear() { if (p_ != none()) { drop(p_); p_ = none(); ++p_->refs; } }
+        const T& get() const { return p_->value; }
+        operator const T&() const { return p_->value; }
+        bool empty() const { return p_->value.empty(); }
+        std::size_t size() const { return p_->value.size(); }
+        auto begin() const { return p_->value.begin(); }
+        auto end() const { return p_->value.end(); }
+        const char* c_str() const { return p_->value.c_str(); }
+        auto operator[](std::size_t i) const { return p_->value[i]; }
+        friend bool operator==(const WebShared& a, const WebShared& b) { return a.p_ == b.p_ || a.p_->value == b.p_->value; }
+        friend bool operator!=(const WebShared& a, const WebShared& b) { return !(a == b); }
+        friend bool operator==(const WebShared& a, const T& b) { return a.p_->value == b; }
+        friend bool operator!=(const WebShared& a, const T& b) { return !(a.p_->value == b); }
+        friend bool operator==(const T& b, const WebShared& a) { return a.p_->value == b; }
+        friend bool operator!=(const T& b, const WebShared& a) { return !(a.p_->value == b); }
+    private:
+        // The empty value: never freed.
+        static Box* none() { static Box* b = new Box{T{}, 1}; return b; }
+        static void drop(Box* b) { if (--b->refs == 0) delete b; }
+        // A reference to `v`: one of the last few made when it is one of
+        // them (the cache holds a reference to each), else a new one.
+        static Box* make(const T& v) {
+            if (v.empty()) { ++none()->refs; return none(); }
+            static Box* recent[8] = {};
+            static unsigned next = 0;
+            for (Box* b : recent) if (b && b->value == v) { ++b->refs; return b; }
+            Box* b = new Box{v, 2};
+            Box*& slot = recent[next++ & 7];
+            if (slot) drop(slot);
+            slot = b;
+            return b;
+        }
+        Box* p_;
+    };
+    using WebText = WebShared<std::string>;
     struct WebState {
         // fill / stroke as CSS; empty while set as a colour (fillRgba) and not
         // yet needed as text.
-        mutable std::string fill = "#000000", stroke = "#000000";
-        std::string font = "10px sans-serif";
+        mutable WebText fill = "#000000", stroke = "#000000";
+        WebText font = "10px sans-serif";
         WebString lineCap = "butt", lineJoin = "miter";
         WebString textAlign = "start", textBaseline = "alphabetic";
         WebString composite = "source-over", filter = "none", direction = "inherit";
         WebString smoothingQuality = "low", shadowColour = "#00000000";
         WebString letterSpacing = "0px", wordSpacing = "0px", fontKerning = "auto";
-        std::vector<float> dash;
+        WebShared<std::vector<float>> dash;
         float lineWidth = 1, alpha = 1, miterLimit = 10, dashOffset = 0;
         float shadowBlur = 0, shadowOffsetX = 0, shadowOffsetY = 0;
         bool smoothing = true;
@@ -466,13 +516,13 @@ public:
         // Member by member (restore()): cheaper than std::swap's three moves.
         // Every member is listed; a new one must be added here.
         void swapWith(WebState& o) {
-            fill.swap(o.fill); stroke.swap(o.stroke); font.swap(o.font);
+            swap(fill, o.fill); swap(stroke, o.stroke); swap(font, o.font);
             std::swap(lineCap, o.lineCap); std::swap(lineJoin, o.lineJoin);
             std::swap(textAlign, o.textAlign); std::swap(textBaseline, o.textBaseline);
             std::swap(composite, o.composite); std::swap(filter, o.filter); std::swap(direction, o.direction);
             std::swap(smoothingQuality, o.smoothingQuality); std::swap(shadowColour, o.shadowColour);
             std::swap(letterSpacing, o.letterSpacing); std::swap(wordSpacing, o.wordSpacing); std::swap(fontKerning, o.fontKerning);
-            dash.swap(o.dash);
+            swap(dash, o.dash);
             std::swap(lineWidth, o.lineWidth); std::swap(alpha, o.alpha); std::swap(miterLimit, o.miterLimit); std::swap(dashOffset, o.dashOffset);
             std::swap(shadowBlur, o.shadowBlur); std::swap(shadowOffsetX, o.shadowOffsetX); std::swap(shadowOffsetY, o.shadowOffsetY);
             std::swap(smoothing, o.smoothing);
@@ -485,7 +535,7 @@ public:
         }
     };
 #if defined(__EMSCRIPTEN__) && !defined(__wasm64__)
-    static_assert(sizeof(WebState) == 224, "WebState changed: update swapWith");
+    static_assert(sizeof(WebState) == 192, "WebState changed: update swapWith");
 #endif
     struct WebFrame { WebState state; bool real = false; };
     // The save() stack. Frames stay allocated when popped, so a save copies

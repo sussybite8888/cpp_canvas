@@ -538,8 +538,8 @@ void Canvas::restore() {
     applied_ = std::move(appliedStack_.back());
     appliedStack_.pop_back();
   }
-  // Swapped, not moved: the frame keeps buffers for the next save to copy into.
-  web_.swapWith(frame.state);
+  // Copied: the state is counted references and plain values.
+  web_ = frame.state;
   webStack_.pop_back();
   dirty_ = kAllStateBits;
   if (ops_->gpu) ops_->gpu->restore();
@@ -553,7 +553,7 @@ void Canvas::reset() {
   pageSeamMoved_ = false; pathUniform_ = true;
   layerDepth_ = 0;
   if (ops_->gpu && !ops_->gpu->generic) {
-    ops_->gpu->clip = WebGpu::Clip{}; ops_->gpu->clipStack.clear();
+    ops_->gpu->clip = WebGpu::Clip{}; ops_->gpu->clipStack.clear(); ops_->gpu->clipChanged();
     ops_->gpu->clearTo(Color{0, 0, 0, 0});
     ops_->gpu->shadowStale = true;
     fill_ = stroke_ = Color{0, 0, 0}; lineWidth_ = 1;
@@ -643,13 +643,13 @@ void Canvas::setFillStyle(const CanvasGradient& g) {
   if (!g.valid()) return;
   STATE(kFillBit, fill, gradientRef(*g.data_)); web_.fillRgbaOk = false;
   web_.fillObject = g.data_;
-  gradientsByRef()[web_.fill] = g.data_;
+  gradientsByRef()[web_.fill.get()] = g.data_;
 }
 void Canvas::setStrokeStyle(const CanvasGradient& g) {
   if (!g.valid()) return;
   STATE(kStrokeBit, stroke, gradientRef(*g.data_)); web_.strokeRgbaOk = false;
   web_.strokeObject = g.data_;
-  gradientsByRef()[web_.stroke] = g.data_;
+  gradientsByRef()[web_.stroke.get()] = g.data_;
 }
 void Canvas::setFillStyle(const CanvasPattern& p) {
   if (!p.valid()) return;
@@ -1015,7 +1015,7 @@ bool webHitStroke(const Path2D& p, const std::array<double, 6>& m, const Canvas:
   sp.width = w.lineWidth; sp.miterLimit = w.miterLimit;
   sp.cap = w.lineCap == "round" ? 1 : w.lineCap == "square" ? 2 : 0;
   sp.join = w.lineJoin == "round" ? 1 : w.lineJoin == "bevel" ? 2 : 0;
-  sp.dash = &w.dash; sp.dashOffset = w.dashOffset;
+  sp.dash = &w.dash.get(); sp.dashOffset = w.dashOffset;
   canvas_detail::Poly flat, dashed, outline, device;
   canvas_detail::strokeToDevice(p.segments().data(), p.segments().size(), floatMatrix(m), sp, flat, dashed, outline, device);
   return canvas_detail::pointInPoly(device, x, y, false);
@@ -1032,7 +1032,7 @@ namespace {
 // cull visible text, while too big a box only culls less.
 void textBox(const Canvas::WebState& w, const std::string& text, float x, float y, float maxWidth, float box[4]) {
   canvas_detail::CssFont f;
-  if (!canvas_detail::parseCssFont(w.font, f)) f.sizePx = 1000;
+  if (!canvas_detail::parseCssFont(w.font.get(), f)) f.sizePx = 1000;
   std::size_t chars = 0;
   for (std::size_t i = 0; i < text.size(); ++i) if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) ++chars;
   float letter = 0, word = 0;
@@ -1084,7 +1084,7 @@ TextMetrics Canvas::measureTextMetrics(const std::string& s) const {
   // Measured left-aligned on the alphabetic baseline; the canvas's own
   // alignment and baseline shift the box the way the browser would.
   canvas_detail::CssFont f;
-  const float size = canvas_detail::parseCssFont(web_.font, f) ? f.sizePx : 10.f;
+  const float size = canvas_detail::parseCssFont(web_.font.get(), f) ? f.sizePx : 10.f;
   (void)size;
   const bool rtl = web_.direction == "rtl";
   std::string a = web_.textAlign;
@@ -1299,8 +1299,8 @@ void Canvas::endLayer() {
   frame.real = false;
   applied_ = std::move(appliedStack_.back());
   appliedStack_.pop_back();
-  // Swapped, not moved: the frame keeps buffers for the next save to copy into.
-  web_.swapWith(frame.state);
+  // Copied: the state is counted references and plain values.
+  web_ = frame.state;
   webStack_.pop_back();
   dirty_ = kAllStateBits;
   notePaint(6, box, false, nullptr);

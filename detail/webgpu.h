@@ -223,7 +223,11 @@ struct WebGpu {
   Clip clip;
   std::vector<Clip> clipStack;
   void save() { clipStack.push_back(clip); }
-  void restore() { if (!clipStack.empty()) { clip = std::move(clipStack.back()); clipStack.pop_back(); } }
+  void restore() { if (!clipStack.empty()) { clip = std::move(clipStack.back()); clipStack.pop_back(); clipChanged(); } }
+  // The style draws take (style()): the clip kept in it as it changes, so a
+  // draw copies no references.
+  mutable GpuStyle st;
+  void clipChanged() { st.clip = clip.mask; st.clipPaths = clip.paths; }
   void clipTo(const Poly& device, bool evenOdd, const float* circle = nullptr) {
     auto shapes = std::make_shared<std::vector<ClipShape>>(clip.shapes ? *clip.shapes : std::vector<ClipShape>{});
     shapes->push_back(ClipShape{device, evenOdd});
@@ -237,6 +241,7 @@ struct WebGpu {
       paths->x0 = std::max(paths->x0, x0 - 1); paths->y0 = std::max(paths->y0, y0 - 1);
       paths->x1 = std::min(paths->x1, x1 + 1); paths->y1 = std::min(paths->y1, y1 + 1);
       clip.paths = std::move(paths);
+      clipChanged();
       return;
     }
     // A fifth: everything so far and it, rasterized.
@@ -245,6 +250,7 @@ struct WebGpu {
       for (const ClipShape& c : *clip.shapes) if (&c != &clip.shapes->back()) mask = makeClipMask(c.poly, c.evenOdd, mask.get(), IBox{0, 0, w, h});
     clip.mask = makeClipMask(device, evenOdd, mask.get(), IBox{0, 0, w, h});
     clip.paths.reset();
+    clipChanged();
   }
 
   bool init(const std::string& id, int width, int height, int shadowId) {
@@ -293,6 +299,7 @@ struct WebGpu {
     for (auto it = canvases.begin(); it != canvases.end();) { if (frame - it->second.used > 300) { G.g.DeleteTextures(1, &it->second.tex); it = canvases.erase(it); } else ++it; }
     for (auto it = images.begin(); it != images.end();) { if (frame - it->second.used > 300) { G.g.DeleteTextures(1, &it->second.tex); it = images.erase(it); } else ++it; }
     if (paths.size() > 8192) { paths.clear(); byKey.clear(); }
+    if (currents.size() > 4096) currents.clear();
   }
   // The shadow gets the GPU's pixels (before a replay, or for whoever reads
   // the canvas's 2D surface).
@@ -403,14 +410,15 @@ struct WebGpu {
   // Whether the state lets the GPU draw at all.
   // (The setters only take valid names: "source-over" is the 11-letter one
   // with an 's' first and an 'o' eighth, and "none" the filter that starts with 'n'.)
+  // (Interned: these compare as pointers.)
+  inline static const Canvas::WebString kSourceOver{"source-over"}, kNoFilter{"none"}, kNoText{""};
   bool plain() const {
-    const std::string& c = ws->composite;
-    const std::string& f = ws->filter;
-    return !generic && c.size() == 11 && c[0] == 's' && c[7] == 'o' && (f.empty() || (f.size() == 4 && f[0] == 'n')) &&
+    return !generic && ws->composite == kSourceOver && (ws->filter == kNoFilter || ws->filter == kNoText) &&
            (ws->shadowBlur <= 0 && ws->shadowOffsetX == 0 && ws->shadowOffsetY == 0 ? true : !shadowVisible());
   }
   int capOf() const { const char c = ws->lineCap.empty() ? 'b' : ws->lineCap[0]; return c == 'r' ? 1 : c == 's' ? 2 : 0; }
-  GpuStyle style(float extraAlpha = 1) const { return GpuStyle{ws->alpha * extraAlpha, clip.mask, clip.paths}; }
+  const GpuStyle& style() const { st.alpha = ws->alpha; return st; }
+  GpuStyle style(float extraAlpha) const { return GpuStyle{ws->alpha * extraAlpha, clip.mask, clip.paths}; }
   bool usePaint(const Paint& p) {
     G.useSolid();
     if (p.kind == PaintKind::Gradient) {
@@ -526,12 +534,23 @@ struct WebGpu {
     const int n = std::max(3, std::min(256, static_cast<int>(std::ceil(std::abs(sweep) * std::sqrt(std::max(r, 1.f)) * 1.1f))));
     const float cr = std::cos(rot), sr = std::sin(rot);
     const bool starts = !hasCurrent;
+    // The angle steps by turning (cos, sin) a fixed step, in double (no drift
+    // worth a float); the last point of an open arc exactly where it ends.
+    const double step = static_cast<double>(sweep) / n, cs = std::cos(step), sn = std::sin(step);
+    double c = std::cos(static_cast<double>(a0)), s = std::sin(static_cast<double>(a0));
+    // Ellipse space -> device, all at once.
+    const float ax = m[0] * cr + m[2] * sr, ay = m[1] * cr + m[3] * sr, bx = m[2] * cr - m[0] * sr, by = m[3] * cr - m[1] * sr;
+    float ox, oy; apply(x, y, ox, oy);
     for (int i = 0; i <= n; ++i) {
       if (full && i == n) break;
-      const float t = a0 + sweep * i / n, px = std::cos(t) * rx, py = std::sin(t) * ry;
-      float X, Y; apply(x + px * cr - py * sr, y + px * sr + py * cr, X, Y);
+      float ux, uy;
+      if (i == n) { ux = std::cos(a0 + sweep) * rx; uy = std::sin(a0 + sweep) * ry; }
+      else { ux = static_cast<float>(c) * rx; uy = static_cast<float>(s) * ry; }
+      const float X = ox + ax * ux + bx * uy, Y = oy + ay * ux + by * uy;
       if (i == 0 && !hasCurrent) moveToDevice(X, Y);
       else lineToDevice(X, Y);
+      const double c2 = c * cs - s * sn;
+      s = s * cs + c * sn; c = c2;
     }
     if (full && starts) closePath();
   }
@@ -643,7 +662,16 @@ struct WebGpu {
     const float hw = action == 0 ? 0.f : ws->lineWidth * 0.5f * std::sqrt(std::abs(m[0] * m[3] - m[1] * m[2]));
     const int cap = capOf();
     if (isCircle) return G.circle(circleX, circleY, circleR, hw, style(), p.colour);
-    if (action == 1 && !gradient && filledVersion == pathVersion && justAfter(currentFill) && G.strokeLastPath(p.colour, hw, cap, style())) return true;
+    if (action == 1 && !gradient && filledVersion == pathVersion && justAfter(currentFill) && (tp.allClosed() || !G.lastIsKept()) &&
+        G.strokeLastPath(p.colour, hw, cap, style())) return true;
+    // A big path drawn again as the same shape (in its own space): its kept bands.
+    if (!gradient && (action == 0 || tp.allClosed()) && bigCurrent() && uniform(m)) {
+      if (KeptCurrent* k = keptCurrent()) {
+        const bool ok = action == 0 ? G.pathKept(k->bands, k->local, m, evenOdd, true, p.colour, false, Color{}, 0, style())
+                                    : G.pathKept(k->bands, k->local, m, false, false, Color{}, true, p.colour, hw, style());
+        if (ok) { if (action == 0) { filledVersion = pathVersion; currentFill = markNow(); } return true; }
+      }
+    }
     if (!gradient) {
       const bool ok = action == 0 ? G.pathTexels(tp, evenOdd, true, p.colour, false, Color{}, 0, cap, style())
                                   : G.pathTexels(tp, false, false, Color{}, true, p.colour, hw, cap, style());
@@ -661,6 +689,61 @@ struct WebGpu {
     static thread_local Poly local;
     transformPoly(device, inv, local);
     return strokeLocal(local, p);
+  }
+  // ----- big current paths drawn again -----
+  // A path built anew each frame under a transform (beginPath, arcs, fill)
+  // is the same shape in its own space each time. Taken back there, its
+  // points find the last frame's (to a fiftieth of a pixel), whose kept
+  // bands draw it with no banding each frame.
+  struct KeptCurrent { Poly local; canvas_detail::GpuSurface::KeptPath bands; std::uint64_t lastFrame = 0; bool again = false; };
+  std::unordered_map<std::uint64_t, KeptCurrent> currents;
+  // Whether the current path is one the GPU would cut into bands.
+  bool bigCurrent() {
+    const std::size_t texels = tp.drawable() / 2;
+    const float hgt = tp.y1 - tp.y0, area = (tp.x1 - tp.x0 + 2) * (hgt + 2);
+    return texels > 20 && hgt > 2 * canvas_detail::GpuSurface::kBandRows && static_cast<float>(texels) * area > 40000.f;
+  }
+  KeptCurrent* keptCurrent() {
+    Matrix inv;
+    if (!canvas_detail::invert(m, inv)) return nullptr;
+    const float scale = std::sqrt(std::abs(m[0] * m[3] - m[1] * m[2]));
+    static thread_local Poly here;
+    here.reset();
+    const std::size_t end = tp.drawable();
+    float lx0 = 1e30f, ly0 = 1e30f, lx1 = -1e30f, ly1 = -1e30f;
+    std::uint64_t key = 0x9E3779B97F4A7C15ull;
+    for (std::size_t i = 0; i < end;) {
+      const int k = static_cast<int>(tp.buf[i]);
+      const bool closed = tp.buf[i + 1] > 0.5f;
+      i += 2;
+      for (int j = 0; j < k; ++j, i += 2) {
+        const float X = tp.buf[i], Y = tp.buf[i + 1];
+        const float x = inv[0] * X + inv[2] * Y + inv[4], y = inv[1] * X + inv[3] * Y + inv[5];
+        here.pts.push_back(x); here.pts.push_back(y);
+        lx0 = std::min(lx0, x); lx1 = std::max(lx1, x); ly0 = std::min(ly0, y); ly1 = std::max(ly1, y);
+      }
+      here.ends.push_back(here.points());
+      here.closed.push_back(closed ? 1 : 0);
+      key = (key ^ (static_cast<std::uint64_t>(k) << 1 | (closed ? 1u : 0u))) * 0xff51afd7ed558ccdull;
+    }
+    if (!(lx0 <= lx1) || !std::isfinite(lx0 + lx1 + ly0 + ly1 + scale)) return nullptr;
+    // Its bounds to a quarter pixel, and its scale to an eighth of a doubling.
+    const float q = 4 * scale;
+    for (float v : {lx0, ly0, lx1, ly1}) key = (key ^ static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v * q + 0.5f)))) * 0xc4ceb9fe1a85ec53ull;
+    key ^= static_cast<std::uint64_t>(std::lround(std::log2(scale) * 8)) << 48;
+    KeptCurrent& c = currents[key];
+    const float tol = 0.02f / scale;
+    bool same = c.local.pts.size() == here.pts.size() && c.local.ends == here.ends && c.local.closed == here.closed;
+    for (std::size_t i = 0; same && i < here.pts.size(); ++i) same = std::abs(here.pts[i] - c.local.pts[i]) <= tol;
+    if (!same) {
+      // New (or another shape by the same key): seen once, not kept yet.
+      std::swap(c.local, here);
+      c.bands = canvas_detail::GpuSurface::KeptPath{};
+      c.lastFrame = frame + 1; c.again = false;
+      return nullptr;
+    }
+    if (c.lastFrame != frame + 1) { c.again = true; c.lastFrame = frame + 1; }
+    return c.again ? &c : nullptr;
   }
   void currentCircleRing(Poly& ring) const {
     ring.reset();
@@ -700,6 +783,10 @@ struct WebGpu {
     int shape = -1;
     bool circle = false;
     float cx = 0, cy = 0, r = 0;
+    bool allClosed = false;               // of `local`
+    std::uint64_t lastFrame = 0;          // the frame it was last drawn in
+    bool again = false;                   // drawn in more than one frame
+    canvas_detail::GpuSurface::KeptPath bands;  // `local` kept on the GPU
   };
   std::unordered_map<std::uint64_t, CachedPath> paths;
   static bool sameSegments(const std::vector<Path2D::Segment>& a, const Path2D::Segment* b, std::size_t n) {
@@ -746,9 +833,14 @@ struct WebGpu {
     return c;
   }
   const Poly& outline(CachedPath& c, float scale) {
-    if (c.scale == 0 || scale > c.scale * 1.5f || scale < c.scale * 0.25f) {
+    // Flattened again only finer: a path drawn at two sizes would otherwise
+    // be flattened anew at each, every frame (and its kept bands with it).
+    if (c.scale == 0 || scale > c.scale * 1.5f) {
       canvas_detail::flatten(c.segs.data(), c.segs.size(), Matrix{1, 0, 0, 1, 0, 0}, scale, c.local);
       c.scale = scale;
+      c.bands = canvas_detail::GpuSurface::KeptPath{};
+      c.allClosed = true;
+      for (char k : c.local.closed) c.allClosed = c.allClosed && k;
     }
     return c.local;
   }
@@ -791,7 +883,17 @@ struct WebGpu {
       const float pen = std::sqrt(std::abs(m[0] * m[3] - m[1] * m[2]));
       const float hw = ws->lineWidth * 0.5f * pen;
       if (action == 1 && filledKey == p2.cacheKey() && filledRevision == p2.revision() && filledMatrix == pm && justAfter(path2dFill) &&
-          G.strokeLastPath(p.colour, hw, cap, style())) return true;
+          (c.allClosed || !G.lastIsKept()) && G.strokeLastPath(p.colour, hw, cap, style())) return true;
+      // Kept on the GPU in its own space, once it is drawn again in a later
+      // frame (a path made anew each frame is not worth keeping): nothing
+      // per point each frame.
+      if (c.lastFrame != frame + 1) { c.again = c.again || c.lastFrame != 0; c.lastFrame = frame + 1; }
+      if (c.again && uniform(pm) && (action == 0 || c.allClosed) &&
+          (action == 0 ? G.pathKept(c.bands, local, pm, evenOdd, true, p.colour, false, Color{}, 0, style())
+                       : G.pathKept(c.bands, local, pm, false, false, Color{}, true, p.colour, hw, style()))) {
+        if (action == 0) { filledKey = p2.cacheKey(); filledRevision = p2.revision(); filledMatrix = pm; path2dFill = markNow(); }
+        return true;
+      }
       if (action == 0 ? G.pathLocal(local, pm, evenOdd, true, p.colour, false, Color{}, 0, cap, style())
                       : G.pathLocal(local, pm, false, false, Color{}, true, p.colour, hw, cap, style())) {
         if (action == 0) { filledKey = p2.cacheKey(); filledRevision = p2.revision(); filledMatrix = pm; path2dFill = markNow(); }

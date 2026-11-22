@@ -185,11 +185,19 @@ Virtual canvases still use the browser's 2D canvas.
   - A fill, its stroke, or both are one quad. The shader finds the winding
     and the distance to the outline at each pixel. Joins are round.
   - A path drawn as one whole circle is a circle primitive.
-  - A Path2D is flattened once, found again by its identity and revision,
-    and transformed straight into the GPU's buffer. Its stroke straight
-    after its fill joins the fill's quad.
+  - A Path2D is flattened once and found again by its identity and
+    revision. Its stroke straight after its fill joins the fill's quad.
+  - From its second frame on, a Path2D is kept on the GPU in its own
+    coordinates, already cut into bands. Each draw under translation,
+    rotation and uniform scale is then one instance carrying the transform,
+    with no work per point. Under other transforms its points are
+    transformed into the GPU's buffer at each draw.
   - Paths taller than 32 pixels are cut into 16-row bands, each with only the
-    segments near it.
+    segments near it. A big current path built the same way each frame
+    (`beginPath`, arcs, `fill` under a transform) is recognised by its shape
+    and drawn from kept bands too.
+  - Kept paths use at most 16 MB. When that fills, they are dropped and
+    re-kept as they are drawn again.
   - Up to four clips are tested per pixel (paths, exact circles). Beyond
     four, the clips become a mask.
   - Large rects and circles use a small shader of their own, and other
@@ -200,19 +208,24 @@ Virtual canvases still use the browser's 2D canvas.
   copied each way, so a frame full of them is slower than without the GPU.
 - **Accuracy:** the conformance scenes match Chrome's 2D canvas to within
   3/255 mean. Miter joins drawn round are the largest difference.
-- **Speed (Apple M2, Chrome, main-thread time per frame):**
+- **Speed (Apple M2, Chrome, main-thread time per frame):** each row's
+  columns were measured in alternating runs on a machine with other work
+  running, so the times are higher than on an idle one. Compare within a row.
 
-  | Scene | GPU | Browser 2D canvas | cp6 |
+  | Scene | GPU | cp6 | Browser 2D canvas |
   |---|---|---|---|
-  | 400 each of circles, stars, polylines | 0.44 ms | 1.7 ms | 0.32 ms |
-  | 1,500 of each | 1.7 ms | 7.5 ms | 1.2 ms |
-  | 300 florr mobs | 2.0–2.3 ms | 3.4–3.9 ms | — |
+  | 400 each of circles, stars, polylines | 1.36 ms | 1.09 ms | — |
+  | 1,500 of each | 2.93 ms | 2.54 ms | — |
+  | 300 florr mobs | 2.2–2.6 ms | — | 3.7–3.8 ms |
 
-  The florr crowd holds 60 fps both ways. Its large translucent glows keep
-  the GPU close to its frame budget. The rest of the gap to cp6 is the canvas
-  API itself: cp6's bench draws a circle with one `circle()` call, where a
-  canvas takes `beginPath`, `arc`, `fill` and `stroke`, and `save`/`restore`
-  carry the whole canvas state.
+  On an idle machine the first row was 0.44 ms on the GPU against 1.7 ms
+  on the browser's 2D canvas. The florr crowd holds 60 fps both ways. Its
+  large translucent glows keep the GPU close to its frame budget.
+
+  Most of the gap to cp6 is circles. cp6's bench draws one with a single
+  `circle()` call; a canvas takes three setters, `beginPath`, `arc`, `fill`
+  and `stroke`. Stars cost about the same in both, and polylines are faster
+  here.
 
 ## API beyond the original
 

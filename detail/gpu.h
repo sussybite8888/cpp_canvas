@@ -39,7 +39,7 @@ namespace gl {
 using GLenum = unsigned int; using GLuint = unsigned int; using GLint = int; using GLsizei = int;
 using GLboolean = unsigned char; using GLbitfield = unsigned int; using GLfloat = float; using GLchar = char;
 using GLsizeiptr = std::ptrdiff_t;
-constexpr GLenum TEXTURE_2D = 0x0DE1, RGBA = 0x1908, RGBA8 = 0x8058, UNSIGNED_BYTE = 0x1401, FLOAT = 0x1406,
+constexpr GLenum TEXTURE_2D = 0x0DE1, RGBA = 0x1908, RGBA8 = 0x8058, UNSIGNED_BYTE = 0x1401, FLOAT = 0x1406, SHORT = 0x1402, UNSIGNED_SHORT = 0x1403,
     RGBA32F = 0x8814, R8 = 0x8229, RED = 0x1903, TEXTURE_MIN_FILTER = 0x2801, TEXTURE_MAG_FILTER = 0x2800,
     NEAREST = 0x2600, LINEAR = 0x2601, TEXTURE_WRAP_S = 0x2802, TEXTURE_WRAP_T = 0x2803, CLAMP_TO_EDGE = 0x812F,
     FRAMEBUFFER = 0x8D40, COLOR_ATTACHMENT0 = 0x8CE0, FRAMEBUFFER_COMPLETE = 0x8CD5, ARRAY_BUFFER = 0x8892,
@@ -201,19 +201,21 @@ struct GpuStyle {
 // One shape: a quad and what the fragment shader needs to cover it.
 struct GpuInst {
     float m[4];        // local -> device, linear part (a b c d)
-    float e, f, kind, flags;
+    float e, f;
     float quad[4];     // x0 y0 x1 y1: local space for images, device for the rest
     float p[4];        // per kind: rect, (edge start, edge count, even-odd), image source rect
-    float clip[4];     // device box everything is clipped to
-    float maskX, maskY, hasMask, alpha;  // device pixel + (maskX, maskY) = its texel in the mask atlas
-    float img[4];      // image placement in its texture: x y w h
-    std::uint32_t colour;                 // straight RGBA
-    float z;                              // draw order: later is nearer
+    float maskX, maskY;  // device pixel + (maskX, maskY) = its texel in the mask atlas (or the clip list)
+    float alpha;
+    float z;           // draw order: later is nearer
+    std::uint16_t clip[4];  // device box everything is clipped to (inside the canvas)
+    std::int16_t img[4];    // image placement in its texture (x y w h), a texel offset, or the stroke colour (0-255)
+    std::uint32_t colour;   // straight RGBA
+    std::uint8_t kind, flags, hasMask, pad;
 };
-static_assert(sizeof(GpuInst) == 120, "instance layout");
+static_assert(sizeof(GpuInst) == 96, "instance layout");
 enum GpuKind { kGpuDevRect = 0, kGpuPoly = 1, kGpuImage = 2, kGpuStroke = 3, kGpuMultiply = 4, kGpuGlyph = 5, kGpuCircle = 6, kGpuPath = 7 };
 enum GpuBlend { kBlendOver = 0, kBlendClear = 1, kBlendMultiply = 2 };
-enum GpuFlags { kGpuNearest = 1, kGpuAxisAligned = 2, kGpuFillAndStroke = 4, kGpuGradient = 8, kGpuCoverage = 16, kGpuPathFill = 64, kGpuPathStroke = 128 };
+enum GpuFlags { kGpuNearest = 1, kGpuAxisAligned = 2, kGpuFillAndStroke = 4, kGpuGradient = 8, kGpuCoverage = 16, kGpuPathKept = 32, kGpuPathFill = 64, kGpuPathStroke = 128 };
 
 // A shelf-packed atlas, R8 or RGBA8.
 struct GpuAtlas {
@@ -249,6 +251,15 @@ struct GpuSurface {
     void (*drawBaseInstance)(gl::GLenum, gl::GLint, gl::GLsizei, gl::GLsizei, gl::GLuint) = nullptr;
     int edgeRows = 0;
     static constexpr int kEdgeWidth = 2048;
+    // Paths kept across frames in their own space (keepPath): x y z w per
+    // texel, uploaded from `keptSent` on; all dropped (keptGen moves on) when
+    // full.
+    std::vector<float> kept;
+    std::size_t keptSent = 0;
+    gl::GLuint keptTex = 0;
+    int keptRows = 0;
+    std::uint32_t keptGen = 1;
+    static constexpr std::size_t kKeptTexels = 1u << 20;  // 16 MB
     GpuAtlas masks, transient, glyphAtlas;
     // Gradients drawn this batch: a colour ramp per row of `ramps`, and
     // kind and geometry per row of `rampParams`.
@@ -324,6 +335,7 @@ struct GpuSurface {
             g.Uniform1i(g.GetUniformLocation(prog, "uGamma"), 3);
             g.Uniform1i(g.GetUniformLocation(prog, "uRamps"), 4);
             g.Uniform1i(g.GetUniformLocation(prog, "uRampParams"), 5);
+            g.Uniform1i(g.GetUniformLocation(prog, "uKept"), 6);
         }
         g.UseProgram(present);
         g.Uniform1i(g.GetUniformLocation(present, "uTex"), 0);
@@ -360,8 +372,9 @@ struct GpuSurface {
         g.BindVertexArray(vao);
         g.GenBuffers(1, &vbo);
         g.BindBuffer(gl::ARRAY_BUFFER, vbo);
-        for (gl::GLuint i = 0; i < 9; ++i) { g.EnableVertexAttribArray(i); g.VertexAttribDivisor(i, 1); }
+        for (gl::GLuint i = 0; i < 10; ++i) { g.EnableVertexAttribArray(i); g.VertexAttribDivisor(i, 1); }
         g.GenTextures(1, &edgeTex);
+        g.GenTextures(1, &keptTex);
         upload(px, IBox{0, 0, w, h});
         ok = true;
         return true;
@@ -371,8 +384,8 @@ struct GpuSurface {
         for (auto& [k, c] : canvases) g.DeleteTextures(1, &c.tex);
         for (auto& [k, c] : copies) g.DeleteTextures(1, &c.tex);
         for (gl::GLuint t : oneOff) g.DeleteTextures(1, &t);
-        gl::GLuint t[9] = {colour, masks.tex, transient.tex, edgeTex, glyphAtlas.tex, gamma, ramps, rampParams, multiplyTex};
-        g.DeleteTextures(multiplyTex ? 9 : 8, t);
+        gl::GLuint t[10] = {colour, masks.tex, transient.tex, edgeTex, glyphAtlas.tex, gamma, ramps, rampParams, keptTex, multiplyTex};
+        g.DeleteTextures(multiplyTex ? 10 : 9, t);
         if (fbo) g.DeleteFramebuffers(1, &fbo);
         if (depth) g.DeleteRenderbuffers(1, &depth);
         if (vbo) g.DeleteBuffers(1, &vbo);
@@ -578,6 +591,13 @@ struct GpuSurface {
     }
     GpuInst& push(gl::GLuint image = 0, int blend = kBlendOver) {
         const float z = nextZ();
+        if (!image && blend == kBlendOver && paintRow < 0 && !batches.empty() && batches.back().blend == kBlendOver && !batches.back().gradients) {
+            // The common case: a plain instance onto a plain batch.
+            ++batches.back().count;
+            inst.emplace_back();
+            zPending = z;
+            return inst.back();
+        }
         const bool gradients = paintRow >= 0;
         // Image 0: an instance that samples no texture, at home in any batch;
         // a batch of those takes on the first texture that comes.
@@ -608,7 +628,18 @@ struct GpuSurface {
         if (s.clipPaths && s.clipPaths->count()) limit = limit.intersect({s.clipPaths->x0, s.clipPaths->y0, s.clipPaths->x1, s.clipPaths->y1});
         return limit;
     }
-    bool setClip(GpuInst& i, const GpuStyle& s, IBox& limit) {
+    // No clip at all (the common case) inline; the rest in setClipAny.
+    __attribute__((always_inline)) bool setClip(GpuInst& i, const GpuStyle& s, IBox& limit) {
+        if (!s.clip && !s.clipPaths) {
+            limit = IBox{0, 0, w, h};
+            i.hasMask = 0; i.maskX = i.maskY = 0;
+            i.clip[0] = 0; i.clip[1] = 0;
+            i.clip[2] = static_cast<std::uint16_t>(std::min(w, 65535)); i.clip[3] = static_cast<std::uint16_t>(std::min(h, 65535));
+            return true;
+        }
+        return setClipAny(i, s, limit);
+    }
+    bool setClipAny(GpuInst& i, const GpuStyle& s, IBox& limit) {
         limit = IBox{0, 0, w, h};
         i.hasMask = 0; i.maskX = i.maskY = 0;
         if (s.clip) {
@@ -628,8 +659,8 @@ struct GpuSurface {
             i.maskX = static_cast<float>(clipList(s.clipPaths));
             i.maskY = static_cast<float>(c.count());
         }
-        i.clip[0] = static_cast<float>(limit.x0); i.clip[1] = static_cast<float>(limit.y0);
-        i.clip[2] = static_cast<float>(limit.x1); i.clip[3] = static_cast<float>(limit.y1);
+        const auto u16 = [](int v) { return static_cast<std::uint16_t>(std::clamp(v, 0, 65535)); };
+        i.clip[0] = u16(limit.x0); i.clip[1] = u16(limit.y0); i.clip[2] = u16(limit.x1); i.clip[3] = u16(limit.y1);
         return true;
     }
     // ----- cp6's paths: subpath headers (count, closed) then points, a
@@ -732,9 +763,9 @@ struct GpuSurface {
         if (!floats) return true;
         if (!(t.x0 <= t.x1) || !std::isfinite(t.x0 + t.x1 + t.y0 + t.y1)) return true;
         const float reach = (doStroke ? hw * (cap == 2 ? 1.5f : 1.f) : 0.f) + 1.f;
-        GpuInst probe{};
+        GpuInst probe;  // (filled in only for a mask clip)
         IBox limit;
-        if (s.clip) { if (!setClip(probe, s, limit)) return false; }
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) return false; }
         else limit = limitOf(s);
         const auto clampI = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
         const IBox q = IBox{clampI(std::floor(t.x0 - reach)), clampI(std::floor(t.y0 - reach)), clampI(std::ceil(t.x1 + reach)), clampI(std::ceil(t.y1 + reach))}.intersect(limit);
@@ -754,7 +785,7 @@ struct GpuSurface {
                 i += 2 * (static_cast<std::size_t>(k) + 1);
             }
             bandSegs.resize(static_cast<std::size_t>(o - bandSegs.data()));
-            if (!s.clip) setClip(probe, s, limit);
+            if (!s.clip) { probe = GpuInst{}; setClip(probe, s, limit); }
             if (bandPath(evenOdd, fill, fc, doStroke, sc, hw, q, reach, probe, s)) return true;
         }
         if (texels * q.area() > kPathBudget) return false;
@@ -793,9 +824,9 @@ struct GpuSurface {
         const auto undo = [&] { edges.resize(at); };
         if (!(bx0 <= bx1) || !std::isfinite(bx0 + bx1 + by0 + by1)) { undo(); return true; }
         const float reach = (doStroke ? hw * (cap == 2 ? 1.5f : 1.f) : 0.f) + 1.f;
-        GpuInst probe{};
+        GpuInst probe;  // (filled in only for a mask clip)
         IBox limit;
-        if (s.clip) { if (!setClip(probe, s, limit)) { undo(); return false; } }
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) { undo(); return false; } }
         else limit = limitOf(s);
         const auto clampI = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
         const IBox q = IBox{clampI(std::floor(bx0 - reach)), clampI(std::floor(by0 - reach)), clampI(std::ceil(bx1 + reach)), clampI(std::ceil(by1 + reach))}.intersect(limit);
@@ -817,7 +848,7 @@ struct GpuSurface {
             }
             bandSegs.resize(static_cast<std::size_t>(g - bandSegs.data()));
             undo();
-            if (!s.clip) setClip(probe, s, limit);
+            if (!s.clip) { probe = GpuInst{}; setClip(probe, s, limit); }
             return bandPath(evenOdd, fill, fc, doStroke, sc, hw, q, reach, probe, s);
         }
         if (texels * q.area() > kPathBudget) { undo(); return false; }
@@ -835,7 +866,7 @@ struct GpuSurface {
         i.e = hw;
         i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
         i.p[0] = static_cast<float>(at); i.p[1] = static_cast<float>(slots); i.p[2] = evenOdd ? 1.f : 0.f; i.p[3] = static_cast<float>(cap);
-        i.img[0] = sc.r / 255.f; i.img[1] = sc.g / 255.f; i.img[2] = sc.b / 255.f; i.img[3] = sc.a / 255.f;
+        i.img[0] = sc.r; i.img[1] = sc.g; i.img[2] = sc.b; i.img[3] = sc.a;
         i.alpha = s.alpha; i.colour = pack(fc);
         lastPath = fill && !doStroke ? inst.size() : 0;
     }
@@ -902,23 +933,161 @@ struct GpuSurface {
             i.e = hw;
             i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(y1);
             i.p[0] = static_cast<float>(2 * at); i.p[1] = static_cast<float>(2 * n + 2); i.p[2] = evenOdd ? 1.f : 0.f; i.p[3] = 0;
-            i.img[0] = sc.r / 255.f; i.img[1] = sc.g / 255.f; i.img[2] = sc.b / 255.f; i.img[3] = sc.a / 255.f;
+            i.img[0] = sc.r; i.img[1] = sc.g; i.img[2] = sc.b; i.img[3] = sc.a;
             i.alpha = s.alpha; i.colour = pack(fc);
         }
         lastPath = 0;
         return true;
     }
+    // ----- a path kept on the GPU in its own space -----
+    // Its segments (closed: a fill closes every subpath) in bands of rows
+    // of its own space, each with the segments within `reach` of it, kept
+    // across frames: a draw of it is one instance with its transform, and
+    // the shader takes each pixel back into the path's space.
+    // At `at`: a header texel (top, 1 / band height, bands, 0), a texel per
+    // band (its first segment texel, count), then the segments (a.xy, b.xy).
+    struct KeptPath {
+        std::uint32_t gen = 0;
+        int at = 0;
+        float reach = 0, scale = 0;  // local reach the bands allow, and the scale they were cut for
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // local bounds
+    };
+    // Whether `k` holds bands of `pl` good for a draw at `scale` needing
+    // `reach` device pixels round each pixel; if not, cuts them. False when
+    // they would not fit.
+    bool keepPath(KeptPath& k, const Poly& pl, float scale, float reach) {
+        // Bands cut for another scale still work (only less well): they are
+        // cut again only when they do not reach far enough. The reach only
+        // grows, so a path drawn at several sizes settles on one cut.
+        float need = reach / scale;
+        if (k.gen == keptGen) {
+            if (k.reach >= need) return true;
+            need = std::max(need, k.reach * 2.f);
+        }
+        // Its segments.
+        bandSegs.clear();
+        float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+        int first = 0;
+        for (std::size_t c = 0; c < pl.ends.size(); ++c) {
+            const int last = pl.ends[c];
+            if (last - first >= 2)
+                for (int i = first; i < last; ++i) {
+                    const int j = i + 1 < last ? i + 1 : first;
+                    const float ax = pl.pts[2 * i], ay = pl.pts[2 * i + 1];
+                    bandSegs.insert(bandSegs.end(), {ax, ay, pl.pts[2 * j], pl.pts[2 * j + 1]});
+                    bx0 = std::min(bx0, ax); bx1 = std::max(bx1, ax); by0 = std::min(by0, ay); by1 = std::max(by1, ay);
+                }
+            first = last;
+        }
+        const std::size_t nseg = bandSegs.size() / 4;
+        if (!nseg || !(bx0 <= bx1) || !std::isfinite(bx0 + bx1 + by0 + by1)) return false;
+        // Bands about 16 device rows tall at this scale; one for a small path.
+        const float slack = need * 1.25f;
+        const float height = by1 - by0;
+        int bands = 1;
+        if (nseg > 20 && height * scale > 2 * kBandRows) bands = std::min(512, static_cast<int>(std::ceil(height * scale / kBandRows)));
+        const float bandH = bands > 1 ? height / bands : 1.f, inv = bands > 1 ? 1.f / bandH : 0.f;
+        const float lastBand = static_cast<float>(bands - 1);
+        bandRange.resize(2 * nseg);
+        bandCount.assign(static_cast<std::size_t>(bands), 0);
+        std::size_t total = 0;
+        for (std::size_t i = 0; i < nseg; ++i) {
+            const float* g = bandSegs.data() + 4 * i;
+            const float lo = std::min(g[1], g[3]) - slack, hi = std::max(g[1], g[3]) + slack;
+            int* r = bandRange.data() + 2 * i;
+            r[0] = static_cast<int>(std::clamp((lo - by0) * inv, 0.f, lastBand));
+            r[1] = static_cast<int>(std::clamp((hi - by0) * inv, 0.f, lastBand));
+            for (int b = r[0]; b <= r[1]; ++b) ++bandCount[static_cast<std::size_t>(b)];
+            total += static_cast<std::size_t>(r[1] - r[0] + 1);
+        }
+        const std::size_t texels = 1 + static_cast<std::size_t>(bands) + total;
+        if (texels > kKeptTexels / 4) return false;
+        if (kept.size() / 4 + texels > kKeptTexels) {
+            // Full: everything kept goes (what is recorded is drawn first).
+            draw();
+            kept.clear(); keptSent = 0; ++keptGen;
+        }
+        const std::size_t at = kept.size() / 4;
+        kept.resize(kept.size() + texels * 4);
+        float* K = kept.data() + at * 4;
+        K[0] = by0; K[1] = inv; K[2] = static_cast<float>(bands); K[3] = 0;
+        std::size_t next = at + 1 + static_cast<std::size_t>(bands);
+        for (int b = 0; b < bands; ++b) {
+            float* h = K + 4 * (1 + b);
+            const int c = bandCount[static_cast<std::size_t>(b)];
+            h[0] = static_cast<float>(next); h[1] = static_cast<float>(c); h[2] = 0; h[3] = 0;
+            bandCount[static_cast<std::size_t>(b)] = static_cast<int>(next);  // now: where its next segment goes
+            next += static_cast<std::size_t>(c);
+        }
+        for (std::size_t i = 0; i < nseg; ++i) {
+            const int* r = bandRange.data() + 2 * i;
+            for (int b = r[0]; b <= r[1]; ++b)
+                std::memcpy(kept.data() + 4 * static_cast<std::size_t>(bandCount[static_cast<std::size_t>(b)]++), bandSegs.data() + 4 * i, 4 * sizeof(float));
+        }
+        k.gen = keptGen; k.at = static_cast<int>(at); k.reach = slack; k.scale = scale;
+        k.x0 = bx0; k.y0 = by0; k.x1 = bx1; k.y1 = by1;
+        return true;
+    }
+    // A kept path under `M` (a similarity: no skew, the same scale both
+    // ways), filled and/or stroked: one instance. False if it cannot be
+    // drawn this way (the caller draws it another).
+    bool pathKept(KeptPath& k, const Poly& pl, const Matrix& M, bool evenOdd, bool fill, Color fc, bool doStroke, Color sc, float hw, const GpuStyle& s) {
+        const float scale = std::sqrt(std::abs(M[0] * M[3] - M[1] * M[2]));
+        if (!(scale > 0) || !std::isfinite(scale)) return false;
+        const float reach = (doStroke ? hw : 0.f) + 1.f;
+        if (!keepPath(k, pl, scale, reach)) return false;
+        GpuInst probe;  // (filled in only for a mask clip)
+        IBox limit;
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) return false; }
+        else limit = limitOf(s);
+        float dx0 = 1e30f, dy0 = 1e30f, dx1 = -1e30f, dy1 = -1e30f;
+        for (int c = 0; c < 4; ++c) {
+            const float x = c & 1 ? k.x1 : k.x0, y = c & 2 ? k.y1 : k.y0;
+            const float X = M[0] * x + M[2] * y + M[4], Y = M[1] * x + M[3] * y + M[5];
+            dx0 = std::min(dx0, X); dx1 = std::max(dx1, X); dy0 = std::min(dy0, Y); dy1 = std::max(dy1, Y);
+        }
+        if (!std::isfinite(dx0 + dx1 + dy0 + dy1)) return true;
+        const auto clampI = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
+        const IBox q = IBox{clampI(std::floor(dx0 - reach)), clampI(std::floor(dy0 - reach)), clampI(std::ceil(dx1 + reach)), clampI(std::ceil(dy1 + reach))}.intersect(limit);
+        if (q.empty()) return true;
+        GpuInst& i = push();
+        if (s.clip) i = probe;
+        else { IBox l; setClip(i, s, l); }
+        stamp(i);
+        i.m[0] = M[0]; i.m[1] = M[1]; i.m[2] = M[2]; i.m[3] = M[3]; i.e = M[4]; i.f = M[5];
+        i.kind = kGpuPath;
+        i.flags = static_cast<float>(kGpuPathKept | (fill ? kGpuPathFill : 0) | (doStroke ? kGpuPathStroke : 0));
+        i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
+        i.p[0] = static_cast<float>(k.at); i.p[1] = 0; i.p[2] = evenOdd ? 1.f : 0.f; i.p[3] = hw;
+        i.img[0] = sc.r; i.img[1] = sc.g; i.img[2] = sc.b; i.img[3] = sc.a;
+        i.alpha = s.alpha; i.colour = pack(fc);
+        lastPath = fill && !doStroke ? inst.size() : 0;
+        lastKept = &k;
+        return true;
+    }
+    const KeptPath* lastKept = nullptr;
+    // Whether the instance last recorded is a fill of a kept path (a stroke
+    // of an open path cannot join it: its bands close every subpath).
+    bool lastIsKept() const { return lastPath && lastPath == inst.size() && (static_cast<int>(inst.back().flags) & kGpuPathKept); }
     bool strokeLastPath(Color sc, float hw, int cap, const GpuStyle& s) {
         if (!lastPath || lastPath != inst.size()) return false;
         GpuInst& i = inst.back();
         if (i.kind != kGpuPath || i.alpha != s.alpha || i.hasMask > 1.5f || s.clipPaths || s.clip) return false;
+        const bool keptPath = (static_cast<int>(i.flags) & kGpuPathKept) != 0;
+        if (keptPath) {
+            // Its bands must reach as far as the stroke does (else it is drawn on its own,
+            // and that cuts bands that do for next time).
+            const float scale = std::sqrt(std::abs(i.m[0] * i.m[3] - i.m[1] * i.m[2]));
+            if (!lastKept || lastKept->gen != keptGen || lastKept->at != static_cast<int>(i.p[0]) || lastKept->reach * scale < hw + 1.f) return false;
+        }
         const float grow = hw * (cap == 2 ? 1.5f : 1.f) + 1.f;
         const IBox q = IBox{static_cast<int>(std::floor(i.quad[0] - grow)), static_cast<int>(std::floor(i.quad[1] - grow)),
                             static_cast<int>(std::ceil(i.quad[2] + grow)), static_cast<int>(std::ceil(i.quad[3] + grow))}.intersect(IBox{0, 0, w, h});
         i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
         i.flags = static_cast<float>(static_cast<int>(i.flags) | kGpuPathStroke);
-        i.e = hw; i.p[3] = static_cast<float>(cap);
-        i.img[0] = sc.r / 255.f; i.img[1] = sc.g / 255.f; i.img[2] = sc.b / 255.f; i.img[3] = sc.a / 255.f;
+        if (keptPath) i.p[3] = hw;
+        else { i.e = hw; i.p[3] = static_cast<float>(cap); }
+        i.img[0] = sc.r; i.img[1] = sc.g; i.img[2] = sc.b; i.img[3] = sc.a;
         lastPath = 0;
         return true;
     }
@@ -956,15 +1125,17 @@ struct GpuSurface {
     // is drawn as its whole-pixel interior, opaque, and the strips of
     // partly covered pixels round it, blended.
     bool rect(float x0, float y0, float x1, float y1, const GpuStyle& s, Color c, bool clear = false) {
-        GpuInst probe{};
+        GpuInst probe;  // (filled in only for a mask clip)
         IBox limit;
-        if (!setClip(probe, s, limit)) return false;
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) return false; }
+        else limit = limitOf(s);
         IBox q = IBox{static_cast<int>(std::floor(x0)), static_cast<int>(std::floor(y0)), static_cast<int>(std::ceil(x1)), static_cast<int>(std::ceil(y1))}.intersect(limit);
         if (q.empty()) return true;
         const auto emit = [&](IBox part, bool solid) {
             if (part.empty()) return;
             GpuInst& i = solid ? pushOpaque() : push(0, clear ? kBlendClear : kBlendOver);
-            i = probe;
+            if (s.clip) i = probe;
+            else { IBox l; setClip(i, s, l); }
             stamp(i);
             identity(i);
             i.kind = kGpuDevRect; i.flags = 0;
@@ -974,10 +1145,12 @@ struct GpuSurface {
             i.colour = pack(c);
             if (!clear) applyPaint(i);
         };
-        if (clear || !opaqueStyle(probe, s, c)) { emit(q, false); return true; }
+        // (No mask: probe.hasMask is 0 when there is no mask clip.)
+        if (clear || paintRow >= 0 || c.a != 255 || s.alpha < 1.f || (s.clip && probe.hasMask >= 0.5f) || (s.clipPaths && s.clipPaths->count())) { emit(q, false); return true; }
         const IBox inner = IBox{static_cast<int>(std::ceil(x0)), static_cast<int>(std::ceil(y0)), static_cast<int>(std::floor(x1)), static_cast<int>(std::floor(y1))}.intersect(q);
         if (inner.empty()) { emit(q, false); return true; }
         emit(inner, true);
+        if (inner.x0 == q.x0 && inner.y0 == q.y0 && inner.x1 == q.x1 && inner.y1 == q.y1) return true;  // whole pixels
         emit(IBox{q.x0, q.y0, q.x1, inner.y0}, false);
         emit(IBox{q.x0, inner.y1, q.x1, q.y1}, false);
         emit(IBox{q.x0, inner.y0, inner.x0, inner.y1}, false);
@@ -1526,7 +1699,7 @@ struct GpuSurface {
         i = probe; stamp(i); identity(i);
         i.kind = kGpuMultiply; i.flags = 0;
         i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
-        i.img[0] = static_cast<float>(-b.x0); i.img[1] = static_cast<float>(-b.y0); i.img[2] = 0; i.img[3] = 0;
+        i.img[0] = static_cast<std::int16_t>(-b.x0); i.img[1] = static_cast<std::int16_t>(-b.y0); i.img[2] = 0; i.img[3] = 0;
         i.alpha = s.alpha;
         i.colour = pack(floor);
         return true;
@@ -1558,7 +1731,7 @@ struct GpuSurface {
         i = probe; stamp(i); identity(i);
         i.kind = kGpuGlyph; i.flags = 0;
         i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
-        i.img[0] = static_cast<float>(found->second.first - x); i.img[1] = static_cast<float>(found->second.second - y);
+        i.img[0] = static_cast<std::int16_t>(found->second.first - x); i.img[1] = static_cast<std::int16_t>(found->second.second - y);
         i.p[0] = static_cast<float>(ramp);
         i.alpha = s.alpha; i.colour = pack(c);
         applyPaint(i);
@@ -1577,15 +1750,15 @@ struct GpuSurface {
                                     static_cast<int>(std::ceil(cx + reach)), static_cast<int>(std::ceil(cy + reach))}.intersect(IBox{0, 0, w, h});
                 f.quad[0] = static_cast<float>(q.x0); f.quad[1] = static_cast<float>(q.y0); f.quad[2] = static_cast<float>(q.x1); f.quad[3] = static_cast<float>(q.y1);
                 f.p[3] = hw;
-                f.img[0] = c.r / 255.f; f.img[1] = c.g / 255.f; f.img[2] = c.b / 255.f; f.img[3] = c.a / 255.f;
+                f.img[0] = c.r; f.img[1] = c.g; f.img[2] = c.b; f.img[3] = c.a;
                 f.flags = static_cast<float>(static_cast<int>(f.flags) | kGpuFillAndStroke);
                 lastCircleFill = 0;
                 return true;
             }
         }
-        GpuInst probe{};
+        GpuInst probe;  // (filled in only for a mask clip)
         IBox limit;
-        if (s.clip) { if (!setClip(probe, s, limit)) return false; }
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) return false; }
         else limit = limitOf(s);
         const float reach = r + std::max(hw, 0.f) + 1.f;
         const IBox q = IBox{static_cast<int>(std::floor(cx - reach)), static_cast<int>(std::floor(cy - reach)),
@@ -1623,7 +1796,7 @@ struct GpuSurface {
         if (f[6] < 0) { sx += sw; sw = -sw; }
         if (f[7] < 0) { sy += sh; sh = -sh; }
         i.p[0] = sx; i.p[1] = sy; i.p[2] = sw; i.p[3] = sh;
-        i.img[0] = ix; i.img[1] = iy; i.img[2] = static_cast<float>(iw); i.img[3] = static_cast<float>(ih);
+        i.img[0] = static_cast<std::int16_t>(ix); i.img[1] = static_cast<std::int16_t>(iy); i.img[2] = static_cast<std::int16_t>(iw); i.img[3] = static_cast<std::int16_t>(ih);
         i.alpha = alpha;
         i.colour = pack(Color{tint.r, tint.g, tint.b, 255});
         return true;
@@ -1701,6 +1874,31 @@ struct GpuSurface {
         g.ActiveTexture(gl::TEXTURE0 + 5);
         g.BindTexture(gl::TEXTURE_2D, rampParams);
         if (!rampKeep.empty()) g.TexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 2, static_cast<gl::GLsizei>(rampKeep.size()), gl::RGBA, gl::FLOAT, rampGeometry.data());
+        // Kept paths: what was added since the last draw.
+        g.ActiveTexture(gl::TEXTURE0 + 6);
+        g.BindTexture(gl::TEXTURE_2D, keptTex);
+        {
+            const int texels = static_cast<int>(kept.size() / 4);
+            const int rows = std::max(1, (texels + kEdgeWidth - 1) / kEdgeWidth);
+            if (rows > keptRows) {
+                keptRows = std::max(rows, std::max(keptRows * 2, 16));
+                g.TexImage2D(gl::TEXTURE_2D, 0, static_cast<gl::GLint>(gl::RGBA32F), kEdgeWidth, keptRows, 0, gl::RGBA, gl::FLOAT, nullptr);
+                g.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, static_cast<gl::GLint>(gl::NEAREST));
+                g.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, static_cast<gl::GLint>(gl::NEAREST));
+                keptSent = 0;
+            }
+            if (kept.size() > keptSent) {
+                // Whole rows, from the one the new texels start in.
+                const int from = static_cast<int>(keptSent / 4) / kEdgeWidth;
+                const std::size_t end = static_cast<std::size_t>(rows) * kEdgeWidth * 4;
+                const std::size_t have = kept.size();
+                kept.resize(end, 0.f);
+                g.PixelStorei(gl::UNPACK_ALIGNMENT, 4);
+                g.TexSubImage2D(gl::TEXTURE_2D, 0, 0, from, kEdgeWidth, rows - from, gl::RGBA, gl::FLOAT, kept.data() + static_cast<std::size_t>(from) * kEdgeWidth * 4);
+                kept.resize(have);
+                keptSent = have;
+            }
+        }
         // Instances.
         g.BindVertexArray(vao);
         g.BindBuffer(gl::ARRAY_BUFFER, vbo);
@@ -1711,10 +1909,19 @@ struct GpuSurface {
         if (!opaque.empty()) g.BufferSubData(gl::ARRAY_BUFFER, 0, static_cast<gl::GLsizeiptr>(opaqueBytes), opaque.data());
         if (!inst.empty()) g.BufferSubData(gl::ARRAY_BUFFER, static_cast<gl::GLsizeiptr>(opaqueBytes), static_cast<gl::GLsizeiptr>(inst.size() * sizeof(GpuInst)), inst.data());
         const auto attributes = [&](std::size_t base) {
-            for (gl::GLuint a = 0; a < 7; ++a)
-                g.VertexAttribPointer(a, 4, gl::FLOAT, 0, sizeof(GpuInst), reinterpret_cast<const void*>(base + a * 16));
-            g.VertexAttribPointer(7, 4, gl::UNSIGNED_BYTE, 1, sizeof(GpuInst), reinterpret_cast<const void*>(base + offsetof(GpuInst, colour)));
-            g.VertexAttribPointer(8, 1, gl::FLOAT, 0, sizeof(GpuInst), reinterpret_cast<const void*>(base + offsetof(GpuInst, z)));
+            const auto at = [&](gl::GLuint a, int n, gl::GLenum type, bool norm, std::size_t off) {
+                g.VertexAttribPointer(a, n, type, norm ? 1 : 0, sizeof(GpuInst), reinterpret_cast<const void*>(base + off));
+            };
+            at(0, 4, gl::FLOAT, false, offsetof(GpuInst, m));
+            at(1, 2, gl::FLOAT, false, offsetof(GpuInst, e));
+            at(2, 4, gl::FLOAT, false, offsetof(GpuInst, quad));
+            at(3, 4, gl::FLOAT, false, offsetof(GpuInst, p));
+            at(4, 3, gl::FLOAT, false, offsetof(GpuInst, maskX));
+            at(5, 1, gl::FLOAT, false, offsetof(GpuInst, z));
+            at(6, 4, gl::UNSIGNED_SHORT, false, offsetof(GpuInst, clip));
+            at(7, 4, gl::SHORT, false, offsetof(GpuInst, img));
+            at(8, 4, gl::UNSIGNED_BYTE, true, offsetof(GpuInst, colour));
+            at(9, 4, gl::UNSIGNED_BYTE, false, offsetof(GpuInst, kind));
         };
         if (!opaque.empty()) {
             g.Disable(gl::BLEND);
@@ -1731,7 +1938,8 @@ struct GpuSurface {
             const int k = static_cast<int>(i.kind);
             if ((k != kGpuCircle && k != kGpuDevRect && k != kGpuPath) || (static_cast<int>(i.flags) & kGpuGradient)) return 0;
             if (k == kGpuPath || i.hasMask > 1.5f) return 3;
-            return (std::min(i.quad[2], i.clip[2]) - std::max(i.quad[0], i.clip[0])) * (std::min(i.quad[3], i.clip[3]) - std::max(i.quad[1], i.clip[1])) > 65536.f ? 2 : 3;
+            const float c0 = i.clip[0], c1 = i.clip[1], c2 = i.clip[2], c3 = i.clip[3];
+            return (std::min(i.quad[2], c2) - std::max(i.quad[0], c0)) * (std::min(i.quad[3], c3) - std::max(i.quad[1], c1)) > 65536.f ? 2 : 3;
         };
         bool attributesSet = false;
         progOf.resize(inst.size());
@@ -1771,7 +1979,7 @@ struct GpuSurface {
         g.BindVertexArray(0);
         g.DepthMask(1);
         g.Disable(gl::DEPTH_TEST);
-        inst.clear(); opaque.clear(); edges.clear(); batches.clear(); seq = 0; lastCircleFill = 0; lastPath = 0;
+        inst.clear(); opaque.clear(); edges.clear(); batches.clear(); seq = 0; lastCircleFill = 0; lastPath = 0; lastKept = nullptr;
         ++drawGen; clipLists.clear(); clipKeep.clear();
         // A draw in the middle of an op keeps the paint it was using.
         const std::shared_ptr<const GradientImpl> current = paintRow >= 0 ? rampKeep[static_cast<std::size_t>(paintRow)] : nullptr;
@@ -1823,15 +2031,15 @@ struct GpuSurface {
         }
     }
 
-    static constexpr const char* kVertex = R"(layout(location=0) in vec4 aM; layout(location=1) in vec4 aEF; layout(location=2) in vec4 aQuad;
-layout(location=3) in vec4 aP; layout(location=4) in vec4 aClip; layout(location=5) in vec4 aMask;
-layout(location=6) in vec4 aImg; layout(location=7) in vec4 aColour; layout(location=8) in float aZ;
+    static constexpr const char* kVertex = R"(layout(location=0) in vec4 aM; layout(location=1) in vec2 aEF; layout(location=2) in vec4 aQuad;
+layout(location=3) in vec4 aP; layout(location=4) in vec3 aMask; layout(location=5) in float aZ;
+layout(location=6) in vec4 aClip; layout(location=7) in vec4 aImg; layout(location=8) in vec4 aColour; layout(location=9) in vec4 aKind;
 uniform vec2 uView;
 flat out vec4 fP; flat out vec4 fClip; flat out vec4 fMask; flat out vec4 fImg; flat out vec4 fColour;
 flat out vec4 fInv; flat out vec2 fInvT; flat out vec4 fQuad; flat out vec4 fDev; flat out vec2 fKind;
 void main() {
   vec2 corner = vec2((gl_VertexID & 1) == 0 ? 0.0 : 1.0, (gl_VertexID & 2) == 0 ? 0.0 : 1.0);
-  int kind = int(aEF.z + 0.5);
+  int kind = int(aKind.x + 0.5);
   vec2 dev;
   mat2 M = mat2(aM.x, aM.y, aM.z, aM.w);
   if (kind == 2) {
@@ -1850,8 +2058,9 @@ void main() {
   mat2 inv = abs(det) > 1e-20 ? inverse(M) : mat2(0.0);
   fInv = vec4(inv[0], inv[1]);
   fInvT = -(inv * aEF.xy);
-  fKind = vec2(aEF.z, aEF.w);
-  fP = aP; fClip = aClip; fMask = aMask; fImg = aImg; fColour = aColour; fQuad = aQuad;
+  fKind = aKind.xy;
+  // Circles and paths keep their stroke colour there, as 0-255.
+  fP = aP; fClip = aClip; fMask = vec4(aMask.xy, aKind.z, aMask.z); fImg = kind == 6 || kind == 7 ? aImg / 255.0 : aImg; fColour = aColour; fQuad = aQuad;
   gl_Position = vec4(dev.x / uView.x * 2.0 - 1.0, dev.y / uView.y * 2.0 - 1.0, aZ * 2.0 - 1.0, 1.0);
 }
 )";
@@ -1887,7 +2096,7 @@ void main() {
     static constexpr const char* kFragment = R"(flat in vec4 fP; flat in vec4 fClip; flat in vec4 fMask; flat in vec4 fImg; flat in vec4 fColour;
 flat in vec4 fInv; flat in vec2 fInvT; flat in vec4 fQuad; flat in vec4 fDev; flat in vec2 fKind;
 uniform highp sampler2D uEdges; uniform sampler2D uMask; uniform sampler2D uImage; uniform sampler2D uGamma;
-uniform sampler2D uRamps; uniform highp sampler2D uRampParams;
+uniform sampler2D uRamps; uniform highp sampler2D uRampParams; uniform highp sampler2D uKept;
 #ifdef GRADIENTS
 // A gradient's colour at device point `c` (premultiplied), as the
 // rasterizer's shader computes it.
@@ -1999,6 +2208,35 @@ vec2 pathDistance(vec2 p, int off, int cnt, bool evenOdd, int cap, float hw) {
   bool inside = evenOdd ? (w & 1) != 0 : w != 0;
   return vec2(inside ? -dF : dF, dS);
 }
+// A path kept in its own space (GpuSurface::keepPath) at device point `pc`:
+// (signed fill distance, stroke distance) in device pixels. The pixel goes
+// back into the path's space, finds its band there, and the distance found
+// there is scaled out (the transform is a similarity).
+vec2 keptDistance(vec2 pc, int h, bool evenOdd) {
+  vec2 p = mat2(fInv.xy, fInv.zw) * pc + fInvT;
+  vec4 hd = texelFetch(uKept, ivec2(h & 2047, h >> 11), 0);
+  int b = clamp(int(floor((p.y - hd.x) * hd.y)), 0, int(hd.z + 0.5) - 1);
+  int bt = h + 1 + b;
+  vec4 bd = texelFetch(uKept, ivec2(bt & 2047, bt >> 11), 0);
+  int s0 = int(bd.x + 0.5), n = int(bd.y + 0.5);
+  float d2 = 1e30; int w = 0;
+  for (int k = 0; k < n; k++) {
+    int t = s0 + k;
+    vec4 sg = texelFetch(uKept, ivec2(t & 2047, t >> 11), 0);
+    vec2 pa = p - sg.xy, ba = sg.zw - sg.xy;
+    vec2 v = pa - ba * clamp(dot(pa, ba) / max(dot(ba, ba), 1e-30), 0.0, 1.0);
+    d2 = min(d2, dot(v, v));
+    w += windingOf(p, sg.xy, sg.zw);
+  }
+  float d = sqrt(d2) * inversesqrt(abs(fInv.x * fInv.w - fInv.y * fInv.z));
+  bool inside = evenOdd ? (w & 1) != 0 : w != 0;
+  return vec2(inside ? -d : d, d);
+}
+// A cp6 path at pixel `pix`: (signed fill distance, stroke distance, half width).
+vec3 pathAt(vec2 pix, int flags) {
+  if ((flags & 32) != 0) return vec3(keptDistance(pix + 0.5, int(fP.x + 0.5), fP.z > 0.5), fP.w);
+  return vec3(pathDistance(pix + 0.5, int(fP.x + 0.5), int(fP.y + 0.5), fP.z > 0.5, int(fP.w + 0.5), fDev.x), fDev.x);
+}
 float span(float a0, float a1, float lo, float hi) { return clamp(min(a1, hi) - max(a0, lo), 0.0, 1.0); }
 vec4 texel(ivec2 t) {
   t = clamp(t, ivec2(0), ivec2(fImg.zw) - 1);
@@ -2036,8 +2274,8 @@ void main() {
   vec4 F = vec4(fColour.rgb * fColour.a, fColour.a);
   vec4 paint;
   if (kind == 7) {
-    vec2 r = pathDistance(pix + 0.5, int(fP.x + 0.5), int(fP.y + 0.5), fP.z > 0.5, int(fP.w + 0.5), fDev.x);
-    float hw = fDev.x;
+    vec3 r = pathAt(pix, flags);
+    float hw = r.z;
     float fa = (flags & 64) != 0 ? clamp(0.5 - r.x, 0.0, 1.0) : 0.0;
     float sa = (flags & 128) != 0 ? clamp(min(r.y + 0.5, hw) - max(r.y - 0.5, -hw), 0.0, 1.0) * fImg.a : 0.0;
     paint = vec4(fImg.rgb * sa, sa) + F * fa * (1.0 - sa);
@@ -2170,8 +2408,8 @@ void main() {
     } else cov = sampled;
   } else if (kind == 7) {
     // cp6's path: the fill under the stroke, one instance.
-    vec2 r = pathDistance(pix + 0.5, int(fP.x + 0.5), int(fP.y + 0.5), fP.z > 0.5, int(fP.w + 0.5), fDev.x);
-    float hw = fDev.x;
+    vec3 r = pathAt(pix, flags);
+    float hw = r.z;
     float fa = (flags & 64) != 0 ? clamp(0.5 - r.x, 0.0, 1.0) * fColour.a : 0.0;
     float sa = (flags & 128) != 0 ? clamp(min(r.y + 0.5, hw) - max(r.y - 0.5, -hw), 0.0, 1.0) * fImg.a : 0.0;
     paint = vec4(fImg.rgb * sa, sa) + vec4(fColour.rgb * fa, fa) * (1.0 - sa);
