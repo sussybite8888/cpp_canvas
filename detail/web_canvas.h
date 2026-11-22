@@ -6,22 +6,21 @@
 // ===========================================================================
 void Canvas::flush() {
   OpBuffer& b = opBuffer();
-  // Whoever recorded a draw FROM this canvas reads it as it is now.
-  beforeWrite();
-  if (b.owner != this || b.count == 0) {
-    pendingCanvases().erase(this);
-    return;
-  }
+  if (b.owner != this || b.count == 0) return;
   if (contextId_ < 0) {
     // Recorded after a move took its context: there is nowhere to send it.
     discardOps(b);
-    pendingCanvases().erase(this);
     return;
   }
+  ++contentVersions()[contextId_];
+  // A GPU canvas records only around what the GPU does not draw, and those
+  // records are for its shadow surface (its 2D context): they go as any
+  // other canvas's do. Anything recorded outside such a span is treated as one.
+  const bool stray = ops_->gpu && !ops_->gpu->generic;
+  if (stray) ops_->gpu->beginGeneric();
   if (cullingEnabled_) gFrameStats.culled += cullBuffer(b, width_, height_, ops_->pathGen);
   const int count = b.count;
   b.count = 0;
-  pendingCanvases().erase(this);
   const double started = emscripten_get_now();
   c2d_flush(contextId_, &b.slots[0].i, count, b.text.empty() ? nullptr : b.text.c_str(), b.paths.empty() ? nullptr : b.paths.data(),
             b.bytes.empty() ? nullptr : b.bytes.data());
@@ -29,11 +28,7 @@ void Canvas::flush() {
   gFrameStats.ops += count;
   ++gFrameStats.batches;
   b.text.clear(); b.paths.clear(); b.bytes.clear();
-  for (const Canvas* s : sources_) {
-    auto& rs = s->readers_;
-    rs.erase(std::remove(rs.begin(), rs.end(), this), rs.end());
-  }
-  sources_.clear();
+  if (stray) ops_->gpu->endGeneric(layerDepth_ > 0);
 }
 void Canvas::setCulling(bool enabled) { cullingEnabled_ = enabled; }
 
@@ -93,14 +88,23 @@ bool canvasRegisterFont(const std::string& family, const std::vector<std::uint8_
 // ===========================================================================
 // State mirror.
 // ===========================================================================
+const std::string* Canvas::WebString::intern(const std::string& s) {
+  // Never freed: these are the few names a canvas state takes.
+  static auto* table = new std::unordered_set<std::string>();
+  return &*table->insert(s).first;
+}
+namespace {
+const std::string& cssFill(const Canvas::WebState& w) { if (w.fill.empty() && w.fillRgbaOk) w.fill = css(w.fillRgba); return w.fill; }
+const std::string& cssStroke(const Canvas::WebState& w) { if (w.stroke.empty() && w.strokeRgbaOk) w.stroke = css(w.strokeRgba); return w.stroke; }
+}  // namespace
 void Canvas::sync(unsigned need) const {
   const unsigned todo = dirty_ & need;
   if (todo == 0) return;
   dirty_ &= ~todo;
   const WebState& w = web_;
   WebState& a = applied_;
-  if ((todo & kFillBit) && w.fill != a.fill) { a.fill = w.fill; a.fillObject = w.fillObject; OP(9, {}, a.fill.c_str()); }
-  if ((todo & kStrokeBit) && w.stroke != a.stroke) { a.stroke = w.stroke; a.strokeObject = w.strokeObject; OP(10, {}, a.stroke.c_str()); }
+  if ((todo & kFillBit) && cssFill(w) != a.fill) { a.fill = w.fill; a.fillObject = w.fillObject; OP(9, {}, a.fill.c_str()); }
+  if ((todo & kStrokeBit) && cssStroke(w) != a.stroke) { a.stroke = w.stroke; a.strokeObject = w.strokeObject; OP(10, {}, a.stroke.c_str()); }
   if ((todo & kAlphaBit) && w.alpha != a.alpha) { a.alpha = w.alpha; OP(11, {a.alpha}); }
   if ((todo & kCompositeBit) && w.composite != a.composite) { a.composite = w.composite; OP(12, {}, a.composite.c_str()); }
   if ((todo & kFilterBit) && w.filter != a.filter) { a.filter = w.filter; OP(13, {}, a.filter.c_str()); }
@@ -142,6 +146,7 @@ void Canvas::forgetPageState() {
   for (WebFrame& frame : webStack_) frame.real = false;
   dirty_ = kAllStateBits;
   frameKnown_ = false;
+  if (ops_->gpu) { ops_->gpu->beginPath(); ops_->gpu->pathStale = false; }
   currentPath_ = Path2D{}; pathMode_ = PathMode::Empty;
   pagePathDirty_ = false; pagePathSegments_ = 0; pathHasSubpath_ = false;
   pageSeamMoved_ = false; pathUniform_ = true;
@@ -387,6 +392,25 @@ void emitPath(const Canvas& c, OpBuffer& b, const Path2D& path, int action, bool
 }  // namespace
 
 void Canvas::pathSegmentAdded() {
+  if (ops_->gpu && !ops_->gpu->generic) {
+    // Nothing is sent: the path is drawn from currentPath_ in the user space
+    // of pathMatrix_. A transform that changes partway takes the path so far
+    // into the new space (arcs become curves), and it carries on there.
+    if (pathMode_ == PathMode::Empty) { pathMatrix_ = web_.matrix; pathMode_ = PathMode::Deferred; pathUniform_ = true; return; }
+    if (web_.matrix == pathMatrix_) return;
+    auto& segs = currentPath_.segments();
+    Path2D old, moved;
+    old.segments().assign(segs.begin(), segs.end() - 1);
+    const Path2D::Segment last = segs.back();
+    canvas_detail::Matrix inv;
+    if (!canvas_detail::invert(toMatrix(web_.matrix), inv)) return;
+    const canvas_detail::Matrix t = canvas_detail::multiply(inv, toMatrix(pathMatrix_));
+    moved.addPath(old, t);
+    moved.segments().push_back(last);
+    currentPath_ = std::move(moved);
+    pathMatrix_ = web_.matrix;
+    return;
+  }
   const Path2D& path = currentPath_;
   switch (pathMode_) {
     case PathMode::Empty:
@@ -431,6 +455,8 @@ void Canvas::preparePagePath(bool fillOnly) const {
   }
 }
 bool Canvas::paintCachedPath(int action, bool evenOdd) {
+  // A GPU canvas reads its paths from the records themselves.
+  if (ops_->gpu) return false;
   if (pathMode_ != PathMode::Deferred || web_.matrix != pathMatrix_) return false;
   const Path2D& path = currentPath_;
   if (!worthCaching(path)) return false;
@@ -465,9 +491,45 @@ void Canvas::emitPathAt(const Path2D& p, int action, bool evenOdd) const {
   do { if (web_.field != (value)) { web_.field = (value); dirty_ |= (bit); } } while (0)
 
 // ===========================================================================
+// A GPU canvas (detail/webgpu.h): each draw goes to the GPU, unless the GPU
+// does not do it; then the code below records it for the shadow surface, as
+// for any canvas, from a page state that starts over.
+// ===========================================================================
+void Canvas::gpuGenericBegin() {
+  // Already recording for the shadow (inside a layer): the page state the
+  // records so far assume stands.
+  if (ops_->gpu->generic) { ops_->gpu->beginGeneric(); return; }
+  ops_->gpu->beginGeneric();
+  applied_ = WebState{};
+  appliedStack_.clear();
+  for (WebFrame& frame : webStack_) frame.real = false;
+  dirty_ = kAllStateBits;
+  frameKnown_ = false;
+}
+void Canvas::gpuGenericEnd() {
+  flush();
+  ops_->gpu->endGeneric(layerDepth_ > 0);
+}
+struct GpuGenericScope {
+  Canvas& c;
+  explicit GpuGenericScope(Canvas& canvas) : c(canvas) { c.gpuGenericBegin(); }
+  ~GpuGenericScope() { c.gpuGenericEnd(); }
+};
+// `fast`: the GPU's way, true when done. Otherwise the rest of the method
+// records the draw for the shadow.
+#define GPU_DRAW(fast) \
+  std::optional<GpuGenericScope> gpuScope_; \
+  if (ops_->gpu) { \
+    ops_->gpu->use(web_); \
+    if (!ops_->gpu->generic && (fast)) { ops_->gpu->shadowStale = true; return; } \
+    gpuScope_.emplace(*this); \
+    gpuSyncPath(); \
+  }
+
+// ===========================================================================
 // The API.
 // ===========================================================================
-void Canvas::save() { webStack_.push_back(WebFrame{web_, false}); }
+void Canvas::save() { webStack_.push(web_); if (ops_->gpu) ops_->gpu->save(); }
 void Canvas::restore() {
   if (webStack_.empty()) return;
   WebFrame& frame = webStack_.back();
@@ -476,17 +538,27 @@ void Canvas::restore() {
     applied_ = std::move(appliedStack_.back());
     appliedStack_.pop_back();
   }
-  web_ = std::move(frame.state);
+  // Swapped, not moved: the frame keeps buffers for the next save to copy into.
+  web_.swapWith(frame.state);
   webStack_.pop_back();
   dirty_ = kAllStateBits;
+  if (ops_->gpu) ops_->gpu->restore();
 }
 void Canvas::reset() {
   webStack_.clear(); appliedStack_.clear();
   web_ = WebState{}; applied_ = WebState{}; dirty_ = 0;
+  if (ops_->gpu) { ops_->gpu->beginPath(); ops_->gpu->pathStale = false; }
   currentPath_ = Path2D{}; pathMode_ = PathMode::Empty;
   pagePathDirty_ = false; pagePathSegments_ = 0; pathHasSubpath_ = false;
   pageSeamMoved_ = false; pathUniform_ = true;
   layerDepth_ = 0;
+  if (ops_->gpu && !ops_->gpu->generic) {
+    ops_->gpu->clip = WebGpu::Clip{}; ops_->gpu->clipStack.clear();
+    ops_->gpu->clearTo(Color{0, 0, 0, 0});
+    ops_->gpu->shadowStale = true;
+    fill_ = stroke_ = Color{0, 0, 0}; lineWidth_ = 1;
+    return;
+  }
   OP(2, {});
   // A reset clears every pixel: nothing before it can show.
   const float box[4] = {0, 0, static_cast<float>(width_), static_cast<float>(height_)};
@@ -524,10 +596,18 @@ Color Canvas::tinted(Color c) const {
   const auto mix = [keep](std::uint8_t base, std::uint8_t add) { return static_cast<std::uint8_t>(std::clamp((base / 255.f * keep + add / 255.f) * 255.f, 0.f, 255.f)); };
   return Color{mix(c.r, tint_.r), mix(c.g, tint_.g), mix(c.b, tint_.b), c.a};
 }
-void Canvas::setFillStyle(Color c) { c = tinted(c); fill_ = c; STATE(kFillBit, fill, css(c)); web_.fillObject.reset(); }
-void Canvas::setStrokeStyle(Color c) { c = tinted(c); stroke_ = c; STATE(kStrokeBit, stroke, css(c)); web_.strokeObject.reset(); }
-void Canvas::setFillStyle(const std::string& s) { if (s.empty() || s[0] == '\x01') return; STATE(kFillBit, fill, s); web_.fillObject.reset(); }
-void Canvas::setStrokeStyle(const std::string& s) { if (s.empty() || s[0] == '\x01') return; STATE(kStrokeBit, stroke, s); web_.strokeObject.reset(); }
+void Canvas::setFillStyle(Color c) {
+  c = tinted(c); fill_ = c;
+  if (web_.fillRgbaOk && web_.fillRgba == c) return;
+  web_.fillRgba = c; web_.fillRgbaOk = true; web_.fill.clear(); web_.fillObject.reset(); dirty_ |= kFillBit;
+}
+void Canvas::setStrokeStyle(Color c) {
+  c = tinted(c); stroke_ = c;
+  if (web_.strokeRgbaOk && web_.strokeRgba == c) return;
+  web_.strokeRgba = c; web_.strokeRgbaOk = true; web_.stroke.clear(); web_.strokeObject.reset(); dirty_ |= kStrokeBit;
+}
+void Canvas::setFillStyle(const std::string& s) { if (s.empty() || s[0] == '\x01') return; STATE(kFillBit, fill, s); web_.fillRgbaOk = false; web_.fillObject.reset(); }
+void Canvas::setStrokeStyle(const std::string& s) { if (s.empty() || s[0] == '\x01') return; STATE(kStrokeBit, stroke, s); web_.strokeRgbaOk = false; web_.strokeObject.reset(); }
 
 namespace {
 int nextObjectId() { static int next = 1; return next++; }
@@ -561,22 +641,24 @@ std::string patternRef(CanvasPattern::Data& d) {
 }  // namespace
 void Canvas::setFillStyle(const CanvasGradient& g) {
   if (!g.valid()) return;
-  STATE(kFillBit, fill, gradientRef(*g.data_));
+  STATE(kFillBit, fill, gradientRef(*g.data_)); web_.fillRgbaOk = false;
   web_.fillObject = g.data_;
+  gradientsByRef()[web_.fill] = g.data_;
 }
 void Canvas::setStrokeStyle(const CanvasGradient& g) {
   if (!g.valid()) return;
-  STATE(kStrokeBit, stroke, gradientRef(*g.data_));
+  STATE(kStrokeBit, stroke, gradientRef(*g.data_)); web_.strokeRgbaOk = false;
   web_.strokeObject = g.data_;
+  gradientsByRef()[web_.stroke] = g.data_;
 }
 void Canvas::setFillStyle(const CanvasPattern& p) {
   if (!p.valid()) return;
-  STATE(kFillBit, fill, patternRef(*p.data_));
+  STATE(kFillBit, fill, patternRef(*p.data_)); web_.fillRgbaOk = false;
   web_.fillObject = p.data_;
 }
 void Canvas::setStrokeStyle(const CanvasPattern& p) {
   if (!p.valid()) return;
-  STATE(kStrokeBit, stroke, patternRef(*p.data_));
+  STATE(kStrokeBit, stroke, patternRef(*p.data_)); web_.strokeRgbaOk = false;
   web_.strokeObject = p.data_;
 }
 namespace {
@@ -672,7 +754,7 @@ void Canvas::setImageSmoothingEnabled(bool a) { STATE(kSmoothingBit, smoothing, 
 void Canvas::setImageSmoothingQuality(const std::string& s) { if (s != "low" && s != "medium" && s != "high") return; STATE(kSmoothingQualityBit, smoothingQuality, s); }
 
 void Canvas::clear(Color c) {
-  beforeWrite();
+  if (ops_->gpu && !ops_->gpu->generic) { ops_->gpu->clearTo(c); ops_->gpu->shadowStale = true; return; }
   // Everything already buffered for this canvas is overwritten; it goes
   // anyway (the cull drops it), so that the state it set still reaches the page.
   OP(58, {}, css(c).c_str());
@@ -681,6 +763,7 @@ void Canvas::clear(Color c) {
 }
 void Canvas::clearRect(float a, float b, float c, float d) {
   if (!finiteArgs({a, b, c, d})) return;
+  GPU_DRAW(ops_->gpu->clearRect(a, b, c, d))
   float box[4], inner[4];
   bool axis;
   rectBoxes(web_.matrix, a, b, c, d, box, inner, axis);
@@ -692,16 +775,18 @@ namespace {
 }  // namespace
 void Canvas::fillRect(float a, float b, float c, float d) {
   if (!finiteArgs({a, b, c, d})) return;
+  GPU_DRAW(ops_->gpu->fillRect(a, b, c, d))
   sync(kFillBits);
   float box[4], inner[4];
   bool axis;
   rectBoxes(web_.matrix, a, b, c, d, box, inner, axis);
   { const PageFrame& f = frameFor(web_.matrix, kFitAffine | kFitAxis); if (!f.same()) mapBox(f, a, b, c, d); }
   OP(31, {a, b, c, d});
-  notePaint(0, box, axis && styleOpaque(web_.fill, web_.fillObject), inner);
+  notePaint(0, box, axis && styleOpaque(cssFill(web_), web_.fillObject), inner);
 }
 void Canvas::strokeRect(float a, float b, float c, float d) {
   if (!finiteArgs({a, b, c, d})) return;
+  GPU_DRAW(ops_->gpu->strokeRect(a, b, c, d))
   sync(kStrokeBits);
   movePageTo(web_.matrix);
   OP(32, {a, b, c, d});
@@ -713,35 +798,59 @@ void Canvas::strokeRect(float a, float b, float c, float d) {
   notePaint(1, box, false, nullptr);
 }
 #define SEGMENT() (pathHasSubpath_ = true, pathSegmentAdded())
+// While the GPU draws, a path is built only on it (in device space, as cp6
+// does); currentPath_ catches up when something needs it (gpuSyncPath).
+#define GPU_PATH(call) do { if (ops_->gpu) { \
+    WebGpu& g_ = *ops_->gpu; \
+    if (g_.generic) gpuSyncPath(); \
+    g_.m = floatMatrix(web_.matrix); g_.call; \
+    if (!g_.generic) { g_.pathStale = true; return; } } } while (0)
+void Canvas::gpuSyncPath() const {
+  WebGpu* g = ops_->gpu.get();
+  if (!g || !g->pathStale) return;
+  g->pathStale = false;
+  Canvas& self = const_cast<Canvas&>(*this);
+  g->m = floatMatrix(web_.matrix);
+  g->currentLocal(self.currentPath_);
+  self.pathMatrix_ = web_.matrix;
+  self.pathUniform_ = true;
+  self.pathMode_ = currentPath_.segments().empty() ? PathMode::Empty : PathMode::Deferred;
+  self.pathHasSubpath_ = g->hasCurrent;
+}
 void Canvas::beginPath() {
-  currentPath_ = Path2D{};
+  if (ops_->gpu) { ops_->gpu->beginPath(); ops_->gpu->pathStale = false; }
+  if (!currentPath_.segments().empty()) currentPath_ = Path2D{};
   if (pathMode_ == PathMode::Sent && pagePathSegments_ > 32) { OP(33, {}); pageSeamMoved_ = false; pagePathDirty_ = false; pagePathSegments_ = 0; }
   pathMode_ = PathMode::Empty;
   pathHasSubpath_ = false;
 }
-void Canvas::closePath() { currentPath_.closePath(); pathSegmentAdded(); }
+void Canvas::closePath() { GPU_PATH(closePath()); currentPath_.closePath(); pathSegmentAdded(); }
 void Canvas::lineTo(float a, float b) {
-  if (!finiteArgs({a, b})) return;
+  if (!std::isfinite(a) || !std::isfinite(b)) return;
+  if (ops_->gpu && !ops_->gpu->generic) { ops_->gpu->lineTo(web_.matrix, a, b); ops_->gpu->pathStale = true; return; }
+  GPU_PATH(lineTo(a, b));
   if (pathHasSubpath_) currentPath_.lineTo(a, b); else currentPath_.moveTo(a, b);
   SEGMENT();
 }
-void Canvas::moveTo(float a, float b) { if (!finiteArgs({a, b})) return; currentPath_.moveTo(a, b); SEGMENT(); }
+void Canvas::moveTo(float a, float b) { if (!finiteArgs({a, b})) return; GPU_PATH(moveTo(a, b)); currentPath_.moveTo(a, b); SEGMENT(); }
 #define ENSURE_SUBPATH(x, y) do { if (!pathHasSubpath_) { currentPath_.moveTo(x, y); SEGMENT(); } } while (0)
-void Canvas::quadraticCurveTo(float a, float b, float c, float d) { if (!finiteArgs({a, b, c, d})) return; ENSURE_SUBPATH(a, b); currentPath_.quadraticCurveTo(a, b, c, d); SEGMENT(); }
-void Canvas::bezierCurveTo(float a, float b, float c, float d, float e, float f) { if (!finiteArgs({a, b, c, d, e, f})) return; ENSURE_SUBPATH(a, b); currentPath_.bezierCurveTo(a, b, c, d, e, f); SEGMENT(); }
-void Canvas::arc(float a, float b, float c, float d, float e, bool f) { if (!finiteArgs({a, b, c, d, e}) || c < 0) return; currentPath_.arc(a, b, c, d, e, f); SEGMENT(); }
+void Canvas::quadraticCurveTo(float a, float b, float c, float d) { if (!finiteArgs({a, b, c, d})) return; GPU_PATH(quadraticCurveTo(a, b, c, d)); ENSURE_SUBPATH(a, b); currentPath_.quadraticCurveTo(a, b, c, d); SEGMENT(); }
+void Canvas::bezierCurveTo(float a, float b, float c, float d, float e, float f) { if (!finiteArgs({a, b, c, d, e, f})) return; GPU_PATH(bezierCurveTo(a, b, c, d, e, f)); ENSURE_SUBPATH(a, b); currentPath_.bezierCurveTo(a, b, c, d, e, f); SEGMENT(); }
+void Canvas::arc(float a, float b, float c, float d, float e, bool f) { if (!finiteArgs({a, b, c, d, e}) || c < 0) return; GPU_PATH(arc(a, b, c, d, e, f)); currentPath_.arc(a, b, c, d, e, f); SEGMENT(); }
 void Canvas::arcTo(float a, float b, float c, float d, float e) {
   if (!finiteArgs({a, b, c, d, e}) || e < 0) return;
+  GPU_PATH(arcTo(a, b, c, d, e));
   if (!pathHasSubpath_) { currentPath_.moveTo(a, b); SEGMENT(); return; }
   currentPath_.arcTo(a, b, c, d, e); SEGMENT();
 }
-void Canvas::ellipse(float a, float b, float c, float d, float e, float f, float g, bool h) { if (!finiteArgs({a, b, c, d, e, f, g}) || c < 0 || d < 0) return; currentPath_.ellipse(a, b, c, d, e, f, g, h); SEGMENT(); }
-void Canvas::rect(float a, float b, float c, float d) { if (!finiteArgs({a, b, c, d})) return; currentPath_.rect(a, b, c, d); SEGMENT(); }
-void Canvas::roundRect(float a, float b, float c, float d, float e) { if (!finiteArgs({a, b, c, d, e}) || e < 0) return; currentPath_.roundRect(a, b, c, d, e); SEGMENT(); }
+void Canvas::ellipse(float a, float b, float c, float d, float e, float f, float g, bool h) { if (!finiteArgs({a, b, c, d, e, f, g}) || c < 0 || d < 0) return; GPU_PATH(ellipse(a, b, c, d, e, f, g, h)); currentPath_.ellipse(a, b, c, d, e, f, g, h); SEGMENT(); }
+void Canvas::rect(float a, float b, float c, float d) { if (!finiteArgs({a, b, c, d})) return; GPU_PATH(rect(a, b, c, d)); currentPath_.rect(a, b, c, d); SEGMENT(); }
+void Canvas::roundRect(float a, float b, float c, float d, float e) { if (!finiteArgs({a, b, c, d, e}) || e < 0) return; GPU_PATH(segments([&](Path2D& p) { p.roundRect(a, b, c, d, e); })); currentPath_.roundRect(a, b, c, d, e); SEGMENT(); }
 void Canvas::roundRect(float a, float b, float c, float d, const std::vector<Path2D::CornerRadius>& r) {
   // The segments a radii list becomes are ordinary ones: one at a time.
   Path2D p;
   p.roundRect(a, b, c, d, r);
+  GPU_PATH(segments([&](Path2D& q) { q.roundRect(a, b, c, d, r); }));
   for (const Path2D::Segment& g : p.segments()) {
     currentPath_.segments().push_back(g);
     SEGMENT();
@@ -776,12 +885,18 @@ bool pathBoxes(const Path2D& p, const std::array<double, 6>& m, float box[4], fl
 }
 }  // namespace
 
+void Canvas::fill() {
+  if (ops_->gpu && ops_->gpu->fastCircle(web_, 0)) { ops_->gpu->shadowStale = true; return; }
+  static const std::string kNonzero = "nonzero";
+  fill(kNonzero);
+}
 void Canvas::fill(const std::string& s) {
+  GPU_DRAW(ops_->gpu->drawCurrent(0, s == "evenodd"))
   sync(kFillBits);
   float box[4], inner[4];
   const bool solidShape = pathBoxes(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, box, inner);
   if (!pathUniform_) { box[0] = box[1] = -1e30f; box[2] = box[3] = 1e30f; }
-  const bool occ = solidShape && pathUniform_ && styleOpaque(web_.fill, web_.fillObject) && s != "evenodd";
+  const bool occ = solidShape && pathUniform_ && styleOpaque(cssFill(web_), web_.fillObject) && s != "evenodd";
   if (paintCachedPath(0, s == "evenodd")) { notePaint(0, box, occ, inner); return; }
   preparePagePath(true);
   OP(44, {}, s.c_str());
@@ -797,6 +912,8 @@ void Canvas::desaturate(const std::string& s) {
   restore();
 }
 void Canvas::stroke() {
+  if (ops_->gpu && ops_->gpu->fastCircle(web_, 1)) { ops_->gpu->shadowStale = true; return; }
+  GPU_DRAW(ops_->gpu->drawCurrent(1, false))
   sync(kStrokeBits);
   float box[4], inner[4];
   pathBoxes(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, box, inner);
@@ -833,6 +950,17 @@ void narrowClip(Canvas::WebState& w, const Path2D& p, const std::array<double, 6
 }
 }  // namespace
 void Canvas::clip(const std::string& s) {
+  if (ops_->gpu) {
+    // The GPU's clip always; the shadow's too while it is drawing (a layer).
+    ops_->gpu->use(web_);
+    ops_->gpu->drawCurrent(2, s == "evenodd");
+    float x0, y0, x1, y1;
+    web_.clipped = true; web_.clipExact = false;
+    if (!ops_->gpu->deviceBox(x0, y0, x1, y1)) { web_.clipX0 = web_.clipY0 = web_.clipX1 = web_.clipY1 = 0; }
+    else { web_.clipX0 = std::max(web_.clipX0, x0); web_.clipY0 = std::max(web_.clipY0, y0); web_.clipX1 = std::min(web_.clipX1, x1); web_.clipY1 = std::min(web_.clipY1, y1); }
+    if (!ops_->gpu->generic) return;
+    gpuSyncPath();
+  }
   realSave();
   narrowClip(web_, currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix);
   if (!pathUniform_) web_.clipExact = false;
@@ -843,13 +971,15 @@ void Canvas::clip(const std::string& s) {
   lastMeta(BUF).pathGen = ops_->pathGen;
 }
 void Canvas::fill(const Path2D& p, const std::string& s) {
+  GPU_DRAW(ops_->gpu->path(p, toMatrix(web_.matrix), 0, s == "evenodd"))
   sync(kFillBits);
   float box[4], inner[4];
   const bool solidShape = pathBoxes(p, web_.matrix, box, inner);
   emitPathAt(p, 0, s == "evenodd");
-  notePaint(0, box, solidShape && styleOpaque(web_.fill, web_.fillObject) && s != "evenodd", inner);
+  notePaint(0, box, solidShape && styleOpaque(cssFill(web_), web_.fillObject) && s != "evenodd", inner);
 }
 void Canvas::stroke(const Path2D& p) {
+  GPU_DRAW(ops_->gpu->path(p, toMatrix(web_.matrix), 1, false))
   sync(kStrokeBits);
   float box[4], inner[4];
   pathBoxes(p, web_.matrix, box, inner);
@@ -860,6 +990,12 @@ void Canvas::stroke(const Path2D& p) {
   notePaint(1, box, false, nullptr);
 }
 void Canvas::clip(const Path2D& p, const std::string& s) {
+  if (ops_->gpu) {
+    ops_->gpu->use(web_);
+    ops_->gpu->path(p, toMatrix(web_.matrix), 2, s == "evenodd");
+    narrowClip(web_, p, web_.matrix);
+    if (!ops_->gpu->generic) return;
+  }
   realSave();
   narrowClip(web_, p, web_.matrix);
   emitPathAt(p, 2, s == "evenodd");
@@ -885,9 +1021,9 @@ bool webHitStroke(const Path2D& p, const std::array<double, 6>& m, const Canvas:
   return canvas_detail::pointInPoly(device, x, y, false);
 }
 }  // namespace
-bool Canvas::isPointInPath(float a, float b, const std::string& s) const { return webHitPath(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, a, b, s == "evenodd"); }
+bool Canvas::isPointInPath(float a, float b, const std::string& s) const { gpuSyncPath(); return webHitPath(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, a, b, s == "evenodd"); }
 bool Canvas::isPointInPath(const Path2D& p, float a, float b, const std::string& s) const { return webHitPath(p, web_.matrix, a, b, s == "evenodd"); }
-bool Canvas::isPointInStroke(float a, float b) const { return webHitStroke(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, web_, a, b); }
+bool Canvas::isPointInStroke(float a, float b) const { gpuSyncPath(); return webHitStroke(currentPath_, pathUniform_ ? pathMatrix_ : web_.matrix, web_, a, b); }
 bool Canvas::isPointInStroke(const Path2D& p, float a, float b) const { return webHitStroke(p, web_.matrix, web_, a, b); }
 
 // ----- text -----
@@ -913,6 +1049,7 @@ void textBox(const Canvas::WebState& w, const std::string& text, float x, float 
 }  // namespace
 void Canvas::fillText(const std::string& s, float a, float b, float c) {
   if (!finiteArgs({a, b}) || c == 0 || std::isnan(c)) return;
+  GPU_DRAW(ops_->gpu->fillText(s, a, b, c))
   sync(kFillBits | kTextBits);
   float box[4];
   textBox(web_, s, a, b, c, box);
@@ -925,6 +1062,7 @@ void Canvas::fillText(const std::string& s, float a, float b, float c) {
 }
 void Canvas::strokeText(const std::string& s, float a, float b, float c) {
   if (!finiteArgs({a, b}) || c == 0 || std::isnan(c)) return;
+  GPU_DRAW(false)
   sync(kStrokeBits | kTextBits);
   float box[4];
   textBox(web_, s, a, b, c, box);
@@ -997,8 +1135,19 @@ void Canvas::drawCanvas(const Canvas& s, float a, float b, float c, float d) {
 }
 void Canvas::drawCanvas(const Canvas& s, float sx, float sy, float sw, float sh, float a, float b, float c, float d) {
   if (s.contextId_ < 0 || !normaliseRects(static_cast<float>(s.width_), static_cast<float>(s.height_), sx, sy, sw, sh, a, b, c, d)) return;
+  if (ops_->gpu && !s.ops_->gpu && opBuffer().owner == &s) const_cast<Canvas&>(s).flush();  // its pixels as they are now
+  {
+    const float f9[9] = {sx, sy, sw, sh, a, b, c, d, 1};
+    GPU_DRAW(!s.ops_->gpu && ops_->gpu->drawCanvas(s.contextId_, f9))
+    drawCanvasRecorded(s, sx, sy, sw, sh, a, b, c, d);
+  }
+}
+void Canvas::drawCanvasRecorded(const Canvas& s, float sx, float sy, float sw, float sh, float a, float b, float c, float d) {
+  // Drawing itself: what is buffered goes first, so that culling cannot drop
+  // a paint the copy reads.
   if (&s == this) flush();
-  else dependOn(s);
+  // A GPU canvas's 2D surface has its pixels only when asked.
+  else if (s.ops_->gpu) { const_cast<Canvas&>(s).flush(); s.ops_->gpu->syncShadow(); }
   sync(kImageBits);
   float box[4], inner[4];
   bool axis;
@@ -1018,6 +1167,8 @@ void Canvas::drawImage(const std::uint8_t* rgba, int iw, int ih, float sx, float
                        float alpha, std::uint32_t key) {
   if (!rgba || iw <= 0 || ih <= 0 || !(alpha > 0)) return;
   if (!normaliseRects(static_cast<float>(iw), static_cast<float>(ih), sx, sy, sw, sh, dx, dy, dw, dh)) return;
+  const float f9[9] = {sx, sy, sw, sh, dx, dy, dw, dh, 1};
+  GPU_DRAW(ops_->gpu->plain() && ops_->gpu->image(ops_->gpu->pixelTexture(rgba, iw, ih, key), iw, ih, f9, alpha, web_.smoothing))
   sync(kImageBits);
   // The pixels become a surface on the page once (per key), here and now:
   // uploading touches no context, so nothing buffered has to go first.
@@ -1071,6 +1222,7 @@ int canvasRemoteImageStatus(int handle, int& width, int& height) {
 void canvasReleaseRemoteImage(int handle) { canvasFlushOps(); c2d_remote_release(handle); }
 void Canvas::drawRemoteImage(int handle, float dx, float dy, float dw, float dh) {
   if (handle <= 0 || dw <= 0 || dh <= 0) return;
+  GPU_DRAW(false)
   sync(kImageBits);
   float box[4], inner[4];
   bool axis;
@@ -1083,6 +1235,7 @@ std::vector<std::uint8_t> Canvas::getImageData(int a, int b, int c, int d) const
   std::vector<std::uint8_t> r(static_cast<std::size_t>(std::max(0, c)) * std::max(0, d) * 4);
   if (r.empty()) return r;
   const_cast<Canvas*>(this)->flush();
+  if (ops_->gpu) return ops_->gpu->readPixels(a, b, c, d);
   c2d_get_pixels(contextId_, a, b, c, d, r.data());
   return r;
 }
@@ -1096,6 +1249,11 @@ void Canvas::putImageData(const std::vector<std::uint8_t>& rgba, int sw, int sh,
   dirtyW = std::min(dirtyW, sw - dirtyX);
   dirtyH = std::min(dirtyH, sh - dirtyY);
   if (dirtyW <= 0 || dirtyH <= 0) return;
+  if (ops_->gpu && !ops_->gpu->generic) {
+    ops_->gpu->putImage(rgba.data() + (static_cast<std::size_t>(dirtyY) * sw + dirtyX) * 4, sw, dx + dirtyX, dy + dirtyY, dirtyW, dirtyH);
+    ops_->gpu->shadowStale = true;
+    return;
+  }
   // Only the dirty rectangle rides in the buffer.
   OpSlot* r = pushRef(*this, BUF, 56, 0,
                       {static_cast<float>(dirtyW), static_cast<float>(dirtyH), static_cast<float>(dx + dirtyX), static_cast<float>(dy + dirtyY)});
@@ -1112,6 +1270,8 @@ void Canvas::strokeCircle(float a, float b, float c) { beginPath(); arc(a, b, c,
 
 // ----- layers -----
 void Canvas::beginLayer() {
+  // On a GPU canvas a layer is drawn on the shadow, begin to end.
+  if (ops_->gpu) gpuGenericBegin();
   sync(kAllStateBits & ~kTransformBit);
   movePageTo(web_.matrix);
   save();
@@ -1130,6 +1290,7 @@ void Canvas::beginLayer() {
 }
 void Canvas::endLayer() {
   if (layerDepth_ <= 0 || webStack_.empty()) return;
+  struct LayerEnd { Canvas& c; ~LayerEnd() { if (c.ops_->gpu) c.gpuGenericEnd(); } } layerEnd{*this};
   --layerDepth_;
   OP(60, {});
   // The composite of the layer: anywhere in the clip.
@@ -1138,7 +1299,8 @@ void Canvas::endLayer() {
   frame.real = false;
   applied_ = std::move(appliedStack_.back());
   appliedStack_.pop_back();
-  web_ = std::move(frame.state);
+  // Swapped, not moved: the frame keeps buffers for the next save to copy into.
+  web_.swapWith(frame.state);
   webStack_.pop_back();
   dirty_ = kAllStateBits;
   notePaint(6, box, false, nullptr);

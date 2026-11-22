@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct Color {
@@ -69,6 +70,17 @@ bool canvasRegisterFont(const std::string& family, const std::vector<std::uint8_
 
 #if defined(CPP_CANVAS_SKIA) && !defined(__EMSCRIPTEN__)
 #error "the Skia backend is built for the browser only"
+#endif
+
+#if !defined(__EMSCRIPTEN__) && !defined(CPP_CANVAS_SKIA)
+class Canvas;
+/// For window.cpp: from now on `canvas` is drawn with the GPU of the
+/// current OpenGL 3.3 context, whose functions `getProc` looks up (by their
+/// "gl..." names). False, and nothing changes, if it cannot be.
+bool canvasAttachGpu(Canvas& canvas, void* (*getProc)(const char*));
+/// Flushes a GPU canvas and draws it over the current framebuffer.
+void canvasShowGpu(Canvas& canvas, int width, int height);
+bool canvasHasGpu(const Canvas& canvas);
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -283,8 +295,9 @@ public:
     float globalAlpha() const;
 #ifndef __EMSCRIPTEN__
     // Device-pixel fast paths for presenters and whole-screen effects: no
-    // transform, the clip and globalAlpha honoured. They read caller memory,
-    // so they execute immediately (after flushing what is recorded).
+    // transform, the clip and globalAlpha honoured. Each is recorded like
+    // any draw, with its own copy of the rows that land, so the caller's
+    // buffer can be reused at once.
     void blitDevice(const std::uint8_t* rgba, int imageWidth, int imageHeight, int deviceX, int deviceY);
     void darkenDevice(const std::uint8_t* mask, int maskWidth, int maskHeight, int deviceX, int deviceY);
     void multiplyDevice(const std::uint8_t* mask, int maskWidth, int maskHeight, int deviceX, int deviceY, Color floor);
@@ -304,7 +317,7 @@ public:
     void ellipse(float x, float y, float radiusX, float radiusY, float rotation, float startAngle, float endAngle, bool counterClockwise = false);
     void rect(float x, float y, float width, float height); void roundRect(float x, float y, float width, float height, float radius);
     void roundRect(float x, float y, float width, float height, const std::vector<Path2D::CornerRadius>& radii);
-    void fill(const std::string& rule = "nonzero"); void stroke(); void clip(const std::string& rule = "nonzero");
+    void fill(); void fill(const std::string& rule); void stroke(); void clip(const std::string& rule = "nonzero");
     void fill(const Path2D& path, const std::string& rule = "nonzero"); void stroke(const Path2D& path); void clip(const Path2D& path, const std::string& rule = "nonzero");
     /// Turns what is painted under the current path to grey: the `saturation`
     /// composite with a grey source.
@@ -394,13 +407,46 @@ public:
     // The drawing state, kept in wasm rather than in the browser context.
     // Paint styles that are objects (gradients, patterns) are named by a
     // reference string beginning with '\x01'.
+    // A string kept once for the whole program (state names such as
+    // "round" or "source-over"): copying one copies a pointer, and two are
+    // equal when they point at the same one.
+    class WebString {
+    public:
+        WebString() : p_(intern(std::string())) {}
+        WebString(const char* s) : p_(intern(s)) {}
+        WebString(const std::string& s) : p_(intern(s)) {}
+        WebString& operator=(const std::string& s) { if (*p_ != s) p_ = intern(s); return *this; }
+        WebString& operator=(const char* s) { if (*p_ != s) p_ = intern(s); return *this; }
+        operator const std::string&() const { return *p_; }
+        const std::string& str() const { return *p_; }
+        const char* c_str() const { return p_->c_str(); }
+        std::size_t size() const { return p_->size(); }
+        bool empty() const { return p_->empty(); }
+        char operator[](std::size_t i) const { return (*p_)[i]; }
+        int compare(std::size_t pos, std::size_t n, const char* t) const { return p_->compare(pos, n, t); }
+        operator std::string_view() const { return *p_; }
+        friend bool operator==(const WebString& a, const WebString& b) { return a.p_ == b.p_; }
+        friend bool operator!=(const WebString& a, const WebString& b) { return a.p_ != b.p_; }
+        friend bool operator==(const WebString& a, const std::string& b) { return *a.p_ == b; }
+        friend bool operator!=(const WebString& a, const std::string& b) { return *a.p_ != b; }
+        friend bool operator==(const std::string& b, const WebString& a) { return *a.p_ == b; }
+        friend bool operator!=(const std::string& b, const WebString& a) { return *a.p_ != b; }
+        friend bool operator==(const WebString& a, const char* b) { return *a.p_ == b; }
+        friend bool operator!=(const WebString& a, const char* b) { return *a.p_ != b; }
+    private:
+        static const std::string* intern(const std::string& s);
+        const std::string* p_;
+    };
     struct WebState {
-        std::string fill = "#000000", stroke = "#000000", font = "10px sans-serif";
-        std::string lineCap = "butt", lineJoin = "miter";
-        std::string textAlign = "start", textBaseline = "alphabetic";
-        std::string composite = "source-over", filter = "none", direction = "inherit";
-        std::string smoothingQuality = "low", shadowColour = "#00000000";
-        std::string letterSpacing = "0px", wordSpacing = "0px", fontKerning = "auto";
+        // fill / stroke as CSS; empty while set as a colour (fillRgba) and not
+        // yet needed as text.
+        mutable std::string fill = "#000000", stroke = "#000000";
+        std::string font = "10px sans-serif";
+        WebString lineCap = "butt", lineJoin = "miter";
+        WebString textAlign = "start", textBaseline = "alphabetic";
+        WebString composite = "source-over", filter = "none", direction = "inherit";
+        WebString smoothingQuality = "low", shadowColour = "#00000000";
+        WebString letterSpacing = "0px", wordSpacing = "0px", fontKerning = "auto";
         std::vector<float> dash;
         float lineWidth = 1, alpha = 1, miterLimit = 10, dashOffset = 0;
         float shadowBlur = 0, shadowOffsetX = 0, shadowOffsetY = 0;
@@ -413,18 +459,73 @@ public:
         bool clipped = false, clipExact = true;
         // Objects the fill/stroke reference strings name, kept alive.
         std::shared_ptr<void> fillObject, strokeObject;
+        // fill / stroke as a colour, when set as one (no parsing to draw it).
+        // (Also filled in when a CSS colour is first parsed to draw with.)
+        mutable Color fillRgba{0, 0, 0, 255}, strokeRgba{0, 0, 0, 255};
+        mutable bool fillRgbaOk = false, strokeRgbaOk = false;
+        // Member by member (restore()): cheaper than std::swap's three moves.
+        // Every member is listed; a new one must be added here.
+        void swapWith(WebState& o) {
+            fill.swap(o.fill); stroke.swap(o.stroke); font.swap(o.font);
+            std::swap(lineCap, o.lineCap); std::swap(lineJoin, o.lineJoin);
+            std::swap(textAlign, o.textAlign); std::swap(textBaseline, o.textBaseline);
+            std::swap(composite, o.composite); std::swap(filter, o.filter); std::swap(direction, o.direction);
+            std::swap(smoothingQuality, o.smoothingQuality); std::swap(shadowColour, o.shadowColour);
+            std::swap(letterSpacing, o.letterSpacing); std::swap(wordSpacing, o.wordSpacing); std::swap(fontKerning, o.fontKerning);
+            dash.swap(o.dash);
+            std::swap(lineWidth, o.lineWidth); std::swap(alpha, o.alpha); std::swap(miterLimit, o.miterLimit); std::swap(dashOffset, o.dashOffset);
+            std::swap(shadowBlur, o.shadowBlur); std::swap(shadowOffsetX, o.shadowOffsetX); std::swap(shadowOffsetY, o.shadowOffsetY);
+            std::swap(smoothing, o.smoothing);
+            std::swap(matrix, o.matrix);
+            std::swap(clipX0, o.clipX0); std::swap(clipY0, o.clipY0); std::swap(clipX1, o.clipX1); std::swap(clipY1, o.clipY1);
+            std::swap(clipped, o.clipped); std::swap(clipExact, o.clipExact);
+            fillObject.swap(o.fillObject); strokeObject.swap(o.strokeObject);
+            std::swap(fillRgba, o.fillRgba); std::swap(strokeRgba, o.strokeRgba);
+            std::swap(fillRgbaOk, o.fillRgbaOk); std::swap(strokeRgbaOk, o.strokeRgbaOk);
+        }
     };
+#if defined(__EMSCRIPTEN__) && !defined(__wasm64__)
+    static_assert(sizeof(WebState) == 224, "WebState changed: update swapWith");
+#endif
     struct WebFrame { WebState state; bool real = false; };
+    // The save() stack. Frames stay allocated when popped, so a save copies
+    // into one already there (its strings keep their storage).
+    struct FrameStack {
+        std::vector<WebFrame> slots;
+        std::size_t n = 0;
+        FrameStack() = default;
+        FrameStack(FrameStack&& o) noexcept : slots(std::move(o.slots)), n(o.n) { o.n = 0; }
+        FrameStack& operator=(FrameStack&& o) noexcept { slots = std::move(o.slots); n = o.n; o.n = 0; return *this; }
+        bool empty() const { return n == 0; }
+        std::size_t size() const { return n; }
+        WebFrame& back() { return slots[n - 1]; }
+        void push(const WebState& s) {
+            if (n < slots.size()) { slots[n].state = s; slots[n].real = false; }
+            else slots.push_back(WebFrame{s, false});
+            ++n;
+        }
+        void pop_back() { --n; slots[n].state.fillObject.reset(); slots[n].state.strokeObject.reset(); }
+        void clear() { slots.clear(); n = 0; }
+        WebFrame* begin() { return slots.data(); }
+        WebFrame* end() { return slots.data() + n; }
+    };
     struct WebOps;
 private:
     WebState web_;
-    std::vector<WebFrame> webStack_;
+    FrameStack webStack_;
     mutable WebState applied_;
     std::vector<WebState> appliedStack_;
     mutable unsigned dirty_ = 0;
     void sync(unsigned fields) const;
     void realSave();
     void forgetPageState();
+    // A GPU canvas (detail/webgpu.h): what its own code records for the
+    // shadow surface, around a draw the GPU does not do.
+    void gpuGenericBegin();
+    void gpuSyncPath() const;
+    void gpuGenericEnd();
+    void drawCanvasRecorded(const Canvas& source, float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh);
+    friend struct GpuGenericScope;
     friend void canvasRecoverContexts();
     friend void canvasFlushOps();
     using PageFrame = CanvasPageFrame;
@@ -463,5 +564,8 @@ private:
 #endif
 #if !defined(__EMSCRIPTEN__)
     std::unique_ptr<Soft> soft_;
+    friend bool canvasAttachGpu(Canvas&, void* (*)(const char*));
+    friend void canvasShowGpu(Canvas&, int, int);
+    friend bool canvasHasGpu(const Canvas&);
 #endif
 };

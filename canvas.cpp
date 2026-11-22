@@ -29,6 +29,7 @@
 #include "detail/web.h"
 #else
 #include "detail/soft.h"
+#include "detail/gpu.h"
 
 CanvasGradient::Data::~Data() = default;
 CanvasPattern::Data::~Data() = default;
@@ -114,6 +115,7 @@ void Canvas::reset() {
     Soft& s = *soft_;
     s.flushReaders();
     s.discardPending();
+    s.cpuOverwrite();
     std::fill(s.px.begin(), s.px.end(), Color{0, 0, 0, 0});
     s.st = Soft::State{};
     s.touch();
@@ -201,6 +203,7 @@ CanvasPattern Canvas::createPattern(const Canvas& source, const std::string& rep
     bool rx, ry;
     if (!parseRepetition(repetition, rx, ry) || !source.soft_) return p;
     source.soft_->flush();
+    source.soft_->syncCpu();
     p.data_ = std::make_shared<CanvasPattern::Data>();
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(source.soft_->px.data());
     p.data_->rgba = std::make_shared<const std::vector<std::uint8_t>>(bytes, bytes + source.soft_->px.size() * 4);
@@ -326,68 +329,69 @@ void Canvas::setImageSmoothingQuality(const std::string& s) {
 
 // ----- device fast paths (immediate) -----
 void Canvas::blitDevice(const std::uint8_t* rgba, int iw, int ih, int dx, int dy) {
+    // Recorded like any other draw. A text cache blits hundreds of runs a
+    // frame; flushing the batch for each one cost a banded flush per label.
     Soft& s = *soft_;
-    s.beforeImmediateWrite();
     const auto& st = s.st.style;
     if (!rgba || iw <= 0 || ih <= 0 || st.alpha <= 0) return;
-    const int x0 = std::max(0, dx), x1 = std::min(width_, dx + iw), y0 = std::max(0, dy), y1 = std::min(height_, dy + ih);
-    if (x0 >= x1 || y0 >= y1) return;
-    const canvas_detail::ClipMask* c = st.clip.get();
-    const std::uint32_t a8 = static_cast<std::uint32_t>(st.alpha * 255 + 0.5f);
-    canvas_detail::parallelRows(y0, y1, static_cast<long long>(x1 - x0) * (y1 - y0), [&](int ya, int yb, int) {
-        for (int y = ya; y < yb; ++y) {
-            const std::uint8_t* src = rgba + (static_cast<std::size_t>(y - dy) * iw + (x0 - dx)) * 4;
-            Color* dst = s.px.data() + static_cast<std::size_t>(y) * width_ + x0;
-            for (int x = x0; x < x1; ++x, src += 4, ++dst) {
-                if (src[3] == 0) continue;
-                std::uint32_t sa = canvas_detail::div255(src[3] * a8);
-                if (c) sa = canvas_detail::div255(sa * c->at(x, y));
-                canvas_detail::blendOver(*dst, Color{src[0], src[1], src[2], 255}, sa);
-            }
+    canvas_detail::IBox box = canvas_detail::IBox{dx, dy, dx + iw, dy + ih}.intersect(s.canvasBox());
+    if (st.clip) box = box.intersect({st.clip->x0, st.clip->y0, st.clip->x1, st.clip->y1});
+    if (box.empty()) return;
+    Op op;
+    op.kind = OpKind::Blit;
+    op.box = box;
+    if (s.deferring && s.layers.empty()) {
+        // Only the rows and columns that can land are kept.
+        const int bw = box.x1 - box.x0;
+        op.a = static_cast<std::uint32_t>(s.bytes.size());
+        op.b = static_cast<std::uint32_t>(bw);
+        op.f[0] = static_cast<float>(box.x0); op.f[1] = static_cast<float>(box.y0);
+        for (int y = box.y0; y < box.y1; ++y) {
+            const std::uint8_t* from = rgba + (static_cast<std::size_t>(y - dy) * iw + (box.x0 - dx)) * 4;
+            s.bytes.insert(s.bytes.end(), from, from + static_cast<std::size_t>(bw) * 4);
         }
-    });
+    } else {
+        op.raw = rgba;
+        op.b = static_cast<std::uint32_t>(iw);
+        op.f[0] = static_cast<float>(dx); op.f[1] = static_cast<float>(dy);
+    }
+    s.submit(op);
 }
 void Canvas::darkenDevice(const std::uint8_t* mask, int mw, int mh, int dx, int dy) {
     multiplyDevice(mask, mw, mh, dx, dy, Color{0, 0, 0, 255});
 }
 void Canvas::multiplyDevice(const std::uint8_t* mask, int mw, int mh, int dx, int dy, Color floor) {
+    // Recorded like blitDevice: a darkness or vignette pass every frame would
+    // otherwise flush the frame, and on the GPU read it all back.
     Soft& s = *soft_;
-    s.beforeImmediateWrite();
     const auto& st = s.st.style;
     if (!mask || mw <= 0 || mh <= 0 || st.alpha <= 0) return;
-    const int x0 = std::max(0, dx), x1 = std::min(width_, dx + mw), y0 = std::max(0, dy), y1 = std::min(height_, dy + mh);
-    if (x0 >= x1 || y0 >= y1) return;
-    const canvas_detail::ClipMask* c = st.clip.get();
-    const float alpha = st.alpha;
-    // What survives of each channel under each mask value.
-    std::array<std::array<std::uint16_t, 256>, 3> keep{};
-    const std::uint8_t floors[3] = {floor.r, floor.g, floor.b};
-    for (int ch = 0; ch < 3; ++ch)
-        for (int m = 0; m < 256; ++m) keep[ch][m] = static_cast<std::uint16_t>(255 - std::lround(m * alpha * (255 - floors[ch]) / 255.f));
-    canvas_detail::parallelRows(y0, y1, static_cast<long long>(x1 - x0) * (y1 - y0), [&](int ya, int yb, int) {
-        for (int y = ya; y < yb; ++y) {
-            const std::uint8_t* src = mask + static_cast<std::size_t>(y - dy) * mw + (x0 - dx);
-            Color* dst = s.px.data() + static_cast<std::size_t>(y) * width_ + x0;
-            for (int x = x0; x < x1;) {
-                if (x + 8 <= x1) {  // a vignette is empty over most of the screen
-                    std::uint64_t word;
-                    std::memcpy(&word, src, 8);
-                    if (word == 0) { x += 8; src += 8; dst += 8; continue; }
-                }
-                std::uint32_t m = *src;
-                if (m && c) m = canvas_detail::div255(m * c->at(x, y));
-                if (m) {
-                    dst->r = static_cast<std::uint8_t>(canvas_detail::div255(dst->r * keep[0][m]));
-                    dst->g = static_cast<std::uint8_t>(canvas_detail::div255(dst->g * keep[1][m]));
-                    dst->b = static_cast<std::uint8_t>(canvas_detail::div255(dst->b * keep[2][m]));
-                }
-                ++x; ++src; ++dst;
-            }
+    canvas_detail::IBox box = canvas_detail::IBox{dx, dy, dx + mw, dy + mh}.intersect(s.canvasBox());
+    if (st.clip) box = box.intersect({st.clip->x0, st.clip->y0, st.clip->x1, st.clip->y1});
+    if (box.empty()) return;
+    Op op;
+    op.kind = OpKind::Multiply;
+    op.box = box;
+    op.tint = floor;
+    if (s.deferring && s.layers.empty()) {
+        const int bw = box.x1 - box.x0;
+        op.a = static_cast<std::uint32_t>(s.bytes.size());
+        op.b = static_cast<std::uint32_t>(bw);
+        op.f[0] = static_cast<float>(box.x0); op.f[1] = static_cast<float>(box.y0);
+        for (int y = box.y0; y < box.y1; ++y) {
+            const std::uint8_t* from = mask + static_cast<std::size_t>(y - dy) * mw + (box.x0 - dx);
+            s.bytes.insert(s.bytes.end(), from, from + bw);
         }
-    });
+    } else {
+        op.raw = mask;
+        op.b = static_cast<std::uint32_t>(mw);
+        op.f[0] = static_cast<float>(dx); op.f[1] = static_cast<float>(dy);
+    }
+    s.submit(op);
 }
 const std::uint8_t* Canvas::pixelData() {
     soft_->flush();
+    soft_->syncCpu();
     return reinterpret_cast<const std::uint8_t*>(soft_->px.data());
 }
 
@@ -396,6 +400,7 @@ void Canvas::clear(Color c) {
     Soft& s = *soft_;
     s.flushReaders();
     s.discardPending();
+    s.cpuOverwrite();
     std::fill(s.px.begin(), s.px.end(), c);
 }
 void Canvas::clearRect(float x, float y, float w, float h) {
@@ -471,6 +476,7 @@ void recordPath(Canvas::Soft& s, OpKind kind, const Path2D& path, bool evenOdd) 
 }
 }  // namespace
 
+void Canvas::fill() { recordPath(*soft_, OpKind::FillPath, currentPath_, false); }
 void Canvas::fill(const std::string& rule) { recordPath(*soft_, OpKind::FillPath, currentPath_, rule == "evenodd"); }
 void Canvas::stroke() { recordPath(*soft_, OpKind::StrokePath, currentPath_, false); }
 void Canvas::clip(const std::string& rule) { clip(currentPath_, rule); }
@@ -651,6 +657,7 @@ void Canvas::drawImage(const ImageLevel* levels, int levelCount, float dx, float
 std::vector<std::uint8_t> Canvas::getImageData(int x, int y, int w, int h) const {
     std::vector<std::uint8_t> r(static_cast<std::size_t>(std::max(0, w)) * std::max(0, h) * 4);
     soft_->flush();
+    soft_->syncCpu();
     const int sx0 = std::max(0, -x), sx1 = std::min(w, width_ - x);
     for (int row = 0; row < h; ++row) {
         const int sy = y + row;
@@ -750,6 +757,7 @@ void Canvas::setCulling(bool enabled) { cullingEnabled_ = enabled; soft_->cullin
 
 bool Canvas::savePPM(const std::string& path) const {
     soft_->flush();
+    soft_->syncCpu();
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     f << "P6\n" << width_ << " " << height_ << "\n255\n";
@@ -761,6 +769,29 @@ bool Canvas::savePPM(const std::string& path) const {
     }
     return !!f;
 }
+
+// ----- the GPU, for window.cpp -----
+bool canvasAttachGpu(Canvas& canvas, void* (*getProc)(const char*)) {
+    Canvas::Soft& s = *canvas.soft_;
+    s.flush();
+    s.syncCpu();
+    auto surface = std::make_unique<canvas_detail::GpuSurface>();
+    if (!surface->init(getProc, s.w, s.h, s.px)) return false;
+    s.gpu = std::move(surface);
+    s.gpuValid = true;
+    s.cpuValid = true;
+    return true;
+}
+void canvasShowGpu(Canvas& canvas, int width, int height) {
+    Canvas::Soft& s = *canvas.soft_;
+    if (!s.gpu) return;
+    s.flush();
+    if (!s.gpuValid) { s.gpu->upload(s.px, s.canvasBox()); s.gpuValid = true; }
+    s.gpu->draw();
+    s.gpu->show(width, height);
+    s.gpu->evict();
+}
+bool canvasHasGpu(const Canvas& canvas) { return canvas.soft_ && canvas.soft_->gpu != nullptr; }
 
 bool canvasRegisterFont(const std::string& family, const std::vector<std::uint8_t>& data, int weight, bool italic) {
     return canvas_detail::FontRegistry::instance().registerFont(family, data, weight, italic);

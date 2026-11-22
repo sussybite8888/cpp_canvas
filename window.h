@@ -177,6 +177,12 @@ public:
     // about a hundred design units, on an iPad about sixty.
     double unitsPerPoint() const;
 
+    // Natively, draw the canvas with the GPU (OpenGL 3.3) when the machine
+    // has it: on by default, CPP_CANVAS_GPU=0 turns it off. Takes effect at
+    // open(); accelerated() says whether the open window got it.
+    void setAccelerated(bool on);
+    bool accelerated() const;
+
     // Browser only: draws into a `desynchronized` (low-latency) 2D context,
     // which skips the compositor and can show a frame half drawn -- a
     // flicker -- so it is off unless asked for. The option can only be given

@@ -5,6 +5,7 @@
 //
 // Included only by canvas.cpp.
 
+#include <atomic>
 #include <chrono>
 
 #include "soft_paint.h"
@@ -42,27 +43,10 @@ struct State {
     std::uint64_t version = 1;
 };
 
-struct IBox {
-    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    bool empty() const { return x0 >= x1 || y0 >= y1; }
-    IBox intersect(const IBox& o) const { return {std::max(x0, o.x0), std::max(y0, o.y0), std::min(x1, o.x1), std::min(y1, o.y1)}; }
-    IBox outset(int l, int t, int r, int b) const { return {x0 - l, y0 - t, x1 + r, y1 + b}; }
-    long long area() const { return empty() ? 0 : static_cast<long long>(x1 - x0) * (y1 - y0); }
-};
-inline IBox toIBox(const Box& b) {
-    if (b.empty()) return {};
-    const auto c = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
-    return {c(std::floor(b.x0)), c(std::floor(b.y0)), c(std::ceil(b.x1)) + 1, c(std::ceil(b.y1)) + 1};
-}
 
 // ---------------------------------------------------------------------------
 // Shaders: the colour of a paint at device pixel centres, premultiplied.
 // ---------------------------------------------------------------------------
-struct ImageCopy {
-    std::vector<std::uint8_t> rgba;
-    int w = 0, h = 0;
-    bool opaque = false;
-};
 inline bool allOpaque(const std::uint8_t* rgba, std::size_t pixels) {
     for (std::size_t i = 0; i < pixels; ++i) if (rgba[i * 4 + 3] != 255) return false;
     return true;
@@ -639,21 +623,6 @@ void produceRect(float X0, float Y0, float X1, float Y1, const IBox& limit, cons
 }
 
 // Is `p` one axis-aligned rectangle (in device space)?
-inline bool polyIsRect(const Poly& p, float& X0, float& Y0, float& X1, float& Y1) {
-    if (p.ends.size() != 1 || p.points() < 4 || p.points() > 5) return false;
-    const float* q = p.pts.data();
-    const int n = p.points();
-    X0 = std::min({q[0], q[2], q[4], q[6]}); X1 = std::max({q[0], q[2], q[4], q[6]});
-    Y0 = std::min({q[1], q[3], q[5], q[7]}); Y1 = std::max({q[1], q[3], q[5], q[7]});
-    if (n == 5 && (q[8] != q[0] || q[9] != q[1])) return false;
-    for (int i = 0; i < 4; ++i) {
-        const float x = q[2 * i], y = q[2 * i + 1];
-        if ((x != X0 && x != X1) || (y != Y0 && y != Y1)) return false;
-        const int j = (i + 1) % 4;
-        if (q[2 * i] != q[2 * j] && q[2 * i + 1] != q[2 * j + 1]) return false;  // diagonal
-    }
-    return true;
-}
 
 // Margins (left, top, right, bottom) by which a filter list spreads ink.
 inline void filterMargins(const std::vector<CssFilterFunction>* f, int& l, int& t, int& r, int& b) {
@@ -731,11 +700,12 @@ inline void applyFilterChain(std::uint8_t* L, int w, int h, const std::vector<Cs
 // ---------------------------------------------------------------------------
 // The display list.
 // ---------------------------------------------------------------------------
-enum class OpKind : std::uint8_t { FillPath, StrokePath, FillRect, StrokeRect, ClearRect, Text, Image, PutImage, Desaturate };
+enum class OpKind : std::uint8_t { FillPath, StrokePath, FillRect, StrokeRect, ClearRect, Text, Image, PutImage, Desaturate, Blit, Multiply };
 
 struct Op {
     OpKind kind = OpKind::FillPath;
     bool evenOdd = false, glyph = false, stroke = false, culled = false, tinted = false;
+    bool fromCanvas = false;  // an Image op whose canvas source was copied (detach)
     std::uint32_t style = 0;
     Matrix m{1, 0, 0, 1, 0, 0};
     float f[10]{};
@@ -769,6 +739,9 @@ inline bool textUsesMasks(const Op& op) {
     const float devSize = op.f[3] * m[0];
     return !op.stroke && upright && op.f[2] == 1.f && devSize <= 192.f && devSize >= 1.f;
 }
+
+struct GpuSurface;  // detail/gpu.h
+inline std::uint64_t nextSoftId() { static std::atomic<std::uint64_t> next{1}; return next++; }
 
 }  // namespace canvas_detail
 
@@ -806,11 +779,28 @@ struct Canvas::Soft {
     std::vector<LayerFrame> layers;
     std::vector<std::uint64_t> occlusion;
 
+    // Drawn with the GPU (detail/gpu.h) when set. Then the pixels live in
+    // its texture, and `px` is a copy kept only as far as it is needed:
+    // cpuValid says px holds them, gpuValid that the texture does.
+    std::unique_ptr<canvas_detail::GpuSurface> gpu;
+    bool cpuValid = true, gpuValid = false;
+    // Changes whenever the pixels may have; with `id`, what a GPU canvas
+    // drawing this one knows its uploaded copy by.
+    std::uint64_t contentVersion = 0;
+    const std::uint64_t id = canvas_detail::nextSoftId();
+
     Soft(int width, int height, Color init) : w(width), h(height), px(static_cast<std::size_t>(width) * height, init) {}
-    ~Soft() {
-        flushReaders();
-        for (Soft* s : sources) s->dropReader(this);
-    }
+    ~Soft();
+    // px holds the pixels (read back from the GPU if they live there).
+    void syncCpu();
+    // px is about to be written outside the GPU: read back first, and the
+    // texture is stale after.
+    void cpuWrite() { syncCpu(); if (gpu) gpuValid = false; ++contentVersion; }
+    // px is about to be overwritten whole: nothing to read back.
+    void cpuOverwrite();
+    void executeGpu();
+    bool gpuCan(const Op& op, const Style& s) const;
+    bool gpuDo(const Op& op, const Style& s);
 
     // ----- state -----
     void touch() { st.version = nextVersion++; }
@@ -826,20 +816,51 @@ struct Canvas::Soft {
     // ----- dependencies between canvases -----
     void dropReader(Soft* r) { readers.erase(std::remove(readers.begin(), readers.end(), r), readers.end()); }
     void flushReaders() {
-        // Whoever has recorded a draw FROM this canvas reads it as it is now.
+        // Whoever has recorded a draw FROM this canvas reads it as it is now:
+        // from a copy of these pixels when that is cheap, else by flushing.
         std::vector<Soft*> rs;
         rs.swap(readers);
-        for (Soft* r : rs) if (r != this) r->flush();
+        for (Soft* r : rs) if (r != this && !r->detach(this)) r->flush();
+    }
+    // Repoints this canvas's pending draws from `src` at a copy of src's
+    // pixels as they are now. A scratch canvas redrawn for every sprite
+    // (florr's glitched mobs) otherwise flushes the whole frame each time.
+    static constexpr std::size_t kMaxDetachPixels = 1u << 20;
+    static constexpr std::size_t kMaxDetachedBytes = 64u << 20;
+    std::size_t detachedBytes = 0;
+    bool detach(Soft* src) {
+        const std::size_t pixels = static_cast<std::size_t>(src->w) * src->h;
+        if (flushing || pixels > kMaxDetachPixels || detachedBytes + pixels * 4 > kMaxDetachedBytes) return false;
+        std::uint32_t index = 0;
+        bool copied = false;
+        for (Op& op : ops) {
+            if (op.src != src) continue;
+            if (!copied) {
+                src->syncCpu();
+                auto copy = std::make_shared<canvas_detail::ImageCopy>();
+                copy->w = src->w; copy->h = src->h;
+                const auto* p = reinterpret_cast<const std::uint8_t*>(src->px.data());
+                copy->rgba.assign(p, p + pixels * 4);
+                index = static_cast<std::uint32_t>(images.size());
+                images.push_back(std::move(copy));
+                detachedBytes += pixels * 4;
+                copied = true;
+            }
+            op.src = nullptr; op.fromCanvas = true; op.a = index;
+        }
+        sources.erase(std::remove(sources.begin(), sources.end(), src), sources.end());
+        return true;
     }
     void dependOn(Soft* src) {
         if (src == this) { flush(); return; }
         src->flush();
+        src->syncCpu();
         if (std::find(src->readers.begin(), src->readers.end(), this) == src->readers.end()) src->readers.push_back(this);
         if (std::find(sources.begin(), sources.end(), src) == sources.end()) sources.push_back(src);
     }
     // Before pixels change outside a flush (immediate writes): draws recorded
     // from this canvas read it as it was.
-    void beforeImmediateWrite() { flushReaders(); flush(); }
+    void beforeImmediateWrite() { flushReaders(); flush(); cpuWrite(); }
 
     // ----- recording -----
     std::uint32_t snapshot() {
@@ -864,12 +885,13 @@ struct Canvas::Soft {
             return;
         }
         flushReaders();
+        cpuWrite();
         execute(op, st.style);
         resetArenasIfIdle();
     }
     void resetArenasIfIdle() {
         if (!ops.empty()) return;
-        segs.clear(); glyphs.clear(); bytes.clear(); images.clear();
+        segs.clear(); glyphs.clear(); bytes.clear(); images.clear(); detachedBytes = 0;
     }
     // The device box an op may change: its geometry's, spread by shadow and
     // filter, the whole clip for the unbounded composite operations, always
@@ -903,7 +925,8 @@ struct Canvas::Soft {
         flushing = true;
         const auto started = std::chrono::steady_clock::now();
         cull();
-        executeOps();
+        if (gpu) executeGpu(); else executeOps();
+        ++contentVersion;
         ops.clear(); styles.clear();
         for (Snap& s : snaps) s = Snap{};
         resetArenasIfIdle();
@@ -1023,7 +1046,7 @@ struct Canvas::Soft {
             if (!plainOpaque || op.f[8] < 1.f || !isAxisAligned(op.m)) return;
             bool opaque = false;
             int iw = 0, ih = 0;
-            if (op.src) { opaque = false; }
+            if (op.src || op.fromCanvas) { opaque = false; }
             else if (op.a < images.size() && images[op.a]) { opaque = images[op.a]->opaque; iw = images[op.a]->w; ih = images[op.a]->h; }
             if (!opaque) return;
             // Only when every destination pixel samples inside the image.
@@ -1494,7 +1517,7 @@ inline void Canvas::Soft::execImage(const Op& op, const Style& s) {
     // A canvas (a sprite) drawn scaled takes the texel under each pixel's
     // centre, unfiltered, as florr.io_clone's copy does -- whatever
     // imageSmoothingEnabled says. Image data and patterns still filter.
-    shader.bilinear = s.smoothing && !op.src;
+    shader.bilinear = s.smoothing && !op.src && !op.fromCanvas;
     shader.grid = shader.bilinear && s.smoothingQuality > 0 ? std::clamp(static_cast<int>(std::ceil(shrink - 0.01f)), 1, 4) : 1;
     // One texel to one pixel on whole-pixel positions: a copy, no filtering.
     const auto integral = [](float v) { return std::abs(v - std::round(v)) < 1e-4f; };
@@ -1570,6 +1593,63 @@ inline void Canvas::Soft::execute(const Op& op, const Style& s) {
     case OpKind::Text: execText(op, s); return;
     case OpKind::Image: execImage(op, s); return;
     case OpKind::Desaturate: execDesaturate(op, s); return;
+    case OpKind::Blit: {
+        // blitDevice: device pixels blended source-over at globalAlpha through
+        // the clip, ignoring transform, composite, filter and shadow.
+        // f: the device position of the source's top-left; bytes at a (or
+        // raw), row stride b pixels; op.box is what it may touch.
+        const IBox lim = op.box.intersect(clipBox(s));
+        if (lim.empty()) return;
+        const int ox = static_cast<int>(op.f[0]), oy = static_cast<int>(op.f[1]);
+        const std::uint8_t* srcBytes = op.raw ? op.raw : bytes.data() + op.a;
+        const ClipMask* c = s.clip.get();
+        const std::uint32_t a8 = static_cast<std::uint32_t>(s.alpha * 255 + 0.5f);
+        for (int y = lim.y0; y < lim.y1; ++y) {
+            const std::uint8_t* src = srcBytes + (static_cast<std::size_t>(y - oy) * op.b + (lim.x0 - ox)) * 4;
+            Color* dst = px.data() + static_cast<std::size_t>(y) * w + lim.x0;
+            for (int x = lim.x0; x < lim.x1; ++x, src += 4, ++dst) {
+                if (src[3] == 0) continue;
+                std::uint32_t sa = div255(src[3] * a8);
+                if (c) sa = div255(sa * c->at(x, y));
+                blendOver(*dst, Color{src[0], src[1], src[2], 255}, sa);
+            }
+        }
+        return;
+    }
+    case OpKind::Multiply: {
+        // multiplyDevice: each colour channel times 1 - mask * alpha * (1 -
+        // floor), through the clip; alpha untouched. f: the device position of
+        // the mask's top-left; bytes at a (or raw), row stride b; tint: floor.
+        const IBox lim = op.box.intersect(clipBox(s));
+        if (lim.empty()) return;
+        const int ox = static_cast<int>(op.f[0]), oy = static_cast<int>(op.f[1]);
+        const std::uint8_t* mask = op.raw ? op.raw : bytes.data() + op.a;
+        const ClipMask* c = s.clip.get();
+        std::array<std::array<std::uint16_t, 256>, 3> keep{};
+        const std::uint8_t floors[3] = {op.tint.r, op.tint.g, op.tint.b};
+        for (int ch = 0; ch < 3; ++ch)
+            for (int m = 0; m < 256; ++m) keep[ch][m] = static_cast<std::uint16_t>(255 - std::lround(m * s.alpha * (255 - floors[ch]) / 255.f));
+        for (int y = lim.y0; y < lim.y1; ++y) {
+            const std::uint8_t* src = mask + static_cast<std::size_t>(y - oy) * op.b + (lim.x0 - ox);
+            Color* dst = px.data() + static_cast<std::size_t>(y) * w + lim.x0;
+            for (int x = lim.x0; x < lim.x1;) {
+                if (x + 8 <= lim.x1) {  // a vignette is empty over most of the screen
+                    std::uint64_t word;
+                    std::memcpy(&word, src, 8);
+                    if (word == 0) { x += 8; src += 8; dst += 8; continue; }
+                }
+                std::uint32_t m = *src;
+                if (m && c) m = div255(m * c->at(x, y));
+                if (m) {
+                    dst->r = static_cast<std::uint8_t>(div255(dst->r * keep[0][m]));
+                    dst->g = static_cast<std::uint8_t>(div255(dst->g * keep[1][m]));
+                    dst->b = static_cast<std::uint8_t>(div255(dst->b * keep[2][m]));
+                }
+                ++x; ++src; ++dst;
+            }
+        }
+        return;
+    }
     case OpKind::PutImage: {
         // f: dx, dy, width, height of the written box; bytes at a, source row stride b pixels.
         const int dx = static_cast<int>(op.f[0]), dy = static_cast<int>(op.f[1]), cw = static_cast<int>(op.f[2]), ch = static_cast<int>(op.f[3]);

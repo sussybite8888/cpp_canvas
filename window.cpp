@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -483,12 +485,17 @@ struct Window::Impl {
   SDL_Window* window = nullptr;
   SDL_Renderer* renderer = nullptr;
   SDL_Texture* texture = nullptr;
+  // GPU mode: the canvas draws itself through this OpenGL context
+  // (canvasAttachGpu) and present() shows it, with no renderer or texture.
+  SDL_GLContext gl = nullptr;
   std::vector<std::uint8_t> rgba;
   Uint64 startCounter = 0, lastFrameCounter = 0;
   // Opened with visible = false: nothing is ever uploaded or presented.
   bool hidden = false;
 #endif
   std::unique_ptr<Canvas> canvas;
+  // Whether open() tries the GPU (native only). CPP_CANVAS_GPU=0 turns it off.
+  bool accelerated = [] { const char* e = std::getenv("CPP_CANVAS_GPU"); return !(e && e[0] == '0'); }();
   // The window as the OS sees it, in points.
   // Doubles because a page's are not whole numbers: see web_css_width.
   double pointWidth = 0, pointHeight = 0;
@@ -1197,13 +1204,29 @@ struct Window::Impl {
   // WITHOUT changing the window's point size, and SDL reports that as neither
   // a RESIZED nor a SIZE_CHANGED event on every platform. Two integer queries
   // a frame is a cheaper way to be right than a table of per-platform events.
+  int drawableWidth = 0, drawableHeight = 0;
+  // A renderer instead: the GPU path could not take this canvas.
+  void dropGpu() {
+    if (!gl) return;
+    std::fprintf(stderr, "[window] GPU canvas unavailable; drawing in software\n");
+    canvas.reset();
+    SDL_GL_DeleteContext(gl);
+    gl = nullptr;
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    pixelWidth = pixelHeight = 0;
+    if (renderer) refreshGeometry();
+  }
   void refreshGeometry() {
-    if (!window || !renderer) return;
+    if (!window || (!renderer && !gl)) return;
 
     int points[2] = {0, 0};
     SDL_GetWindowSize(window, &points[0], &points[1]);
     int drawable[2] = {0, 0};
-    SDL_GetRendererOutputSize(renderer, &drawable[0], &drawable[1]);
+    if (gl) SDL_GL_GetDrawableSize(window, &drawable[0], &drawable[1]);
+    else SDL_GetRendererOutputSize(renderer, &drawable[0], &drawable[1]);
+    drawableWidth = drawable[0];
+    drawableHeight = drawable[1];
     if (points[0] <= 0 || points[1] <= 0 || drawable[0] <= 0 || drawable[1] <= 0) return;
 
     pointWidth = points[0];
@@ -1217,11 +1240,15 @@ struct Window::Impl {
       pixelHeight = wantPixelH;
       // Canvas cannot be resized in place, so the backing surfaces are
       // rebuilt. This is why callers must not hold canvas() across pump().
+      canvas.reset();  // its GPU objects go while the context is current
       canvas = std::make_unique<Canvas>(pixelWidth, pixelHeight);
-      rgba.assign(static_cast<std::size_t>(pixelWidth) * pixelHeight * 4, 0);
-      if (texture) SDL_DestroyTexture(texture);
-      texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
-                                  SDL_TEXTUREACCESS_STREAMING, pixelWidth, pixelHeight);
+      if (gl && !canvasAttachGpu(*canvas, &SDL_GL_GetProcAddress)) dropGpu();
+      if (!gl) {
+        rgba.assign(static_cast<std::size_t>(pixelWidth) * pixelHeight * 4, 0);
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
+                                    SDL_TEXTUREACCESS_STREAMING, pixelWidth, pixelHeight);
+      }
     }
 
     recomputeScales();
@@ -1307,10 +1334,34 @@ bool Window::open(int width, int height, const std::string& title, std::string& 
   // stretches it, so every pixel drawn is a blurry pair of pixels shown. With
   // it the caller has to deal in three sizes -- see the header -- which is
   // what uiScale() and the design space are for.
-  impl_->window = SDL_CreateWindow(title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                   width, height,
-                                   (visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN) |
-                                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+  const Uint32 windowFlags = (visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN) |
+                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+  // The GPU first (an OpenGL 3.3 core context the canvas draws with), the
+  // renderer if that cannot be had.
+  if (impl_->accelerated) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+    impl_->window = SDL_CreateWindow(title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                     width, height, windowFlags | SDL_WINDOW_OPENGL);
+    if (impl_->window) {
+      impl_->gl = SDL_GL_CreateContext(impl_->window);
+      if (impl_->gl) {
+        SDL_GL_MakeCurrent(impl_->window, impl_->gl);
+        SDL_GL_SetSwapInterval(1);
+      } else {
+        SDL_DestroyWindow(impl_->window);
+        impl_->window = nullptr;
+      }
+    }
+  }
+  if (!impl_->window)
+    impl_->window = SDL_CreateWindow(title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                     width, height, windowFlags);
   if (!impl_->window) { errorOut = SDL_GetError(); SDL_Quit(); return false; }
 
   // The canvas is stretched to the drawable whenever renderScale() < 1, and
@@ -1318,13 +1369,13 @@ bool Window::open(int width, int height, const std::string& title, std::string& 
   // than a setting. The browser build's equivalent is `image-rendering: auto`.
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 
-  impl_->renderer = SDL_CreateRenderer(impl_->window, -1,
+  if (!impl_->gl) impl_->renderer = SDL_CreateRenderer(impl_->window, -1,
                                        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-  if (!impl_->renderer) {
+  if (!impl_->gl && !impl_->renderer) {
     // Software is slow but correct; a missing GPU path must not be fatal.
     impl_->renderer = SDL_CreateRenderer(impl_->window, -1, SDL_RENDERER_SOFTWARE);
   }
-  if (!impl_->renderer) {
+  if (!impl_->gl && !impl_->renderer) {
     errorOut = SDL_GetError();
     SDL_DestroyWindow(impl_->window); impl_->window = nullptr; SDL_Quit();
     return false;
@@ -1333,7 +1384,7 @@ bool Window::open(int width, int height, const std::string& title, std::string& 
   // Builds the canvas, the texture and every derived scale from what the OS
   // actually gave us, which on a HiDPI display is not what was asked for.
   impl_->refreshGeometry();
-  if (!impl_->canvas || !impl_->texture) {
+  if (!impl_->canvas || (!impl_->gl && !impl_->texture)) {
     errorOut = SDL_GetError();
     close();
     return false;
@@ -1376,6 +1427,7 @@ void Window::close() {
 #else
   if (impl_->texture) { SDL_DestroyTexture(impl_->texture); impl_->texture = nullptr; }
   if (impl_->renderer) { SDL_DestroyRenderer(impl_->renderer); impl_->renderer = nullptr; }
+  if (impl_->gl) { impl_->canvas.reset(); SDL_GL_DeleteContext(impl_->gl); impl_->gl = nullptr; }
   for (SDL_Cursor*& cursor : impl_->cursors) {
     if (cursor) { SDL_FreeCursor(cursor); cursor = nullptr; }
   }
@@ -1541,6 +1593,14 @@ void Window::setRenderScale(double scale) {
 
 bool Window::desynchronized() const { return impl_->desynchronized; }
 
+void Window::setAccelerated(bool on) { impl_->accelerated = on; }
+bool Window::accelerated() const {
+#ifdef __EMSCRIPTEN__
+  return false;
+#else
+  return impl_->gl != nullptr;
+#endif
+}
 void Window::setDesynchronized(bool on) {
   if (on == impl_->desynchronized) return;
   impl_->desynchronized = on;
@@ -1572,7 +1632,16 @@ void Window::present() {
   // under the pointer during the frame, and only the last word of the frame
   // should reach the OS.
   impl_->applyCursor();
-  if (!impl_->canvas || !impl_->texture) return;
+  if (!impl_->canvas) return;
+  if (impl_->gl) {
+    // The canvas is a texture already: drawn over the window, stretched to
+    // the drawable as the renderer would.
+    if (impl_->hidden) { impl_->canvas->flush(); return; }
+    canvasShowGpu(*impl_->canvas, impl_->drawableWidth, impl_->drawableHeight);
+    SDL_GL_SwapWindow(impl_->window);
+    return;
+  }
+  if (!impl_->texture) return;
   // Nobody can see it, and a GPU presenting into a window that is not on
   // screen is free to stall the frame until it is.
   if (impl_->hidden) return;

@@ -96,7 +96,12 @@ public:
 
 private:
     BandPool() {
+#ifdef __EMSCRIPTEN__
+        // No threads in the browser build: one band, on the caller.
+        const unsigned hardware = 1;
+#else
         const unsigned hardware = std::thread::hardware_concurrency();
+#endif
         bands_ = static_cast<int>(std::min(hardware ? hardware : 1u, 8u));
         if (bands_ < 1) bands_ = 1;
         for (int i = 1; i < bands_; ++i) workers_.emplace_back([this] { loop(); });

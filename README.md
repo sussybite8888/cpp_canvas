@@ -103,12 +103,116 @@ The tests compare a frame flushed at once with the same frame flushed after
 every draw.
 
 A draw that reads another canvas, such as `drawCanvas()` or
-`createPattern()`, sees that canvas as it was when the call was made. The
-library tracks this dependency and flushes in the right order. A source canvas
-with nothing pending does not flush the canvases drawing from it, so drawing
-one sprite canvas hundreds of times stays a single batch. `drawImage()` with
+`createPattern()`, sees that canvas as it was when the call was made. On the
+native backend the library tracks this dependency: a source canvas with
+nothing pending does not flush the canvases drawing from it, so drawing one
+sprite canvas hundreds of times stays a single batch, and a source that is
+about to change hands each canvas still waiting to draw it a copy of its
+pixels (up to 1M pixels a source, 64 MB a batch; past that it flushes them)
+rather than flushing them, so a scratch canvas redrawn for every sprite does
+not split the frame into hundreds of flushes. In the browser the shared buffer keeps every call in order by itself,
+and a canvas is never destroyed while a buffered call still reads it; its
+browser surface is then kept (up to 64 surfaces, 4M pixels) and resized for
+the next canvas made, since apps that make and drop scratch canvases every
+frame otherwise pay for a new surface and context each time. `drawImage()` with
 raw pixels copies them, or keeps one copy per `cacheKey`, so the caller's
 buffer can be reused straight away.
+
+## Drawing with the GPU (native)
+
+A native `Window` draws its canvas with the GPU when the machine has OpenGL
+3.3. It is on by default. `CPP_CANVAS_GPU=0`, or `setAccelerated(false)`
+before `open()`, turns it off, and `accelerated()` says whether the open
+window got it. Without OpenGL the window falls back to the software path.
+The approach is florrcustom's cp6 renderer: every shape is one instanced
+quad, and a fragment shader works out how much of each pixel it covers. The
+geometry is still this library's: paths are flattened, and strokes outlined
+(joins, caps, dashes), by the code the rasterizer uses.
+
+- **What the GPU draws:**
+  - Fills and strokes in solid colours and linear, radial and conic
+    gradients.
+  - Images, sprites, tinted sprites, `blitDevice`, `putImageData`,
+    `multiplyDevice`/`darkenDevice` and `clearRect`.
+  - Text from glyph masks.
+  - Rectangle and path clips.
+- **Coverage:**
+  - Fills use the rasterizer's exact area coverage. They are cut into
+    16-pixel tiles, each listing only the edges that cross it. A tile where
+    pieces of a path overlap is sampled on 8 lines instead.
+  - Small convex and simple polygons, and whole circles, are covered by
+    distance from their outline in one quad each.
+  - Strokes that keep circles circular are covered by distance from their
+    centre line, as cp6 does. Miter joins and square caps add small wedges.
+- **Order:** fully covered opaque pieces are drawn first, with depth, so the
+  GPU skips whatever a later opaque piece hides.
+- **What it does not draw:**
+  - Patterns, shadows and filters.
+  - Composite operations other than source-over.
+  - Text drawn from outlines.
+  - Layers.
+
+  Those draws run in the software rasterizer on a copy of the region they
+  touch. A batch with many of them, or covering more than half the canvas,
+  runs wholly in software.
+- **Reading back:** the window canvas's pixels live in a texture. Anything
+  that reads them (`getImageData()`, `pixelData()`, drawing this canvas onto
+  another) reads them back first.
+- **Accuracy:** `tools/gpu_check/run.sh` draws `tests/scenes.cpp` both ways.
+  The GPU matches the software renderer
+  to within 1/255 mean in every scene.
+  - Distance coverage differs from area coverage at a few edge pixels: up
+    to 30 levels on round caps and joins, more at sharp miter tips and the
+    corners of 1-pixel rectangle strokes (a handful of pixels per scene).
+  - A whole florr.io_clone frame differs by 0.06/255 mean.
+- **Speed (Apple M2):**
+  - 300 florr mobs: 14–17 ms a frame on one core, against 23–28 ms in
+    software on eight.
+  - 8,000 rotated sprites: 39 ms against 270 ms.
+- Apps that keep their own GL context can call `canvasAttachGpu()` on any
+  canvas.
+
+## Drawing with the GPU (web)
+
+In the browser, a canvas on a page element draws with WebGL2 when the
+browser has it. It is on by default. `?canvas-gpu=0` in the page URL, or
+`Module.cppCanvasGpu = false` before the module starts, turns it off.
+Virtual canvases still use the browser's 2D canvas.
+
+- **How it draws:** as cp6 does, and with its approximations.
+  - The current path is built in device space as it is made. Arcs and curves
+    are flattened then.
+  - A fill, its stroke, or both are one quad. The shader finds the winding
+    and the distance to the outline at each pixel. Joins are round.
+  - A path drawn as one whole circle is a circle primitive.
+  - A Path2D is flattened once, found again by its identity and revision,
+    and transformed straight into the GPU's buffer. Its stroke straight
+    after its fill joins the fill's quad.
+  - Paths taller than 32 pixels are cut into 16-row bands, each with only the
+    segments near it.
+  - Up to four clips are tested per pixel (paths, exact circles). Beyond
+    four, the clips become a mask.
+  - Large rects and circles use a small shader of their own, and other
+    rects, circles and paths a second one.
+- **What it hands to the browser's 2D canvas:** patterns, shadows, filters,
+  composite operations other than source-over, `strokeText`, remote images
+  and layers. These are replayed on a hidden 2D canvas, with the pixels
+  copied each way, so a frame full of them is slower than without the GPU.
+- **Accuracy:** the conformance scenes match Chrome's 2D canvas to within
+  3/255 mean. Miter joins drawn round are the largest difference.
+- **Speed (Apple M2, Chrome, main-thread time per frame):**
+
+  | Scene | GPU | Browser 2D canvas | cp6 |
+  |---|---|---|---|
+  | 400 each of circles, stars, polylines | 0.44 ms | 1.7 ms | 0.32 ms |
+  | 1,500 of each | 1.7 ms | 7.5 ms | 1.2 ms |
+  | 300 florr mobs | 2.0–2.3 ms | 3.4–3.9 ms | — |
+
+  The florr crowd holds 60 fps both ways. Its large translucent glows keep
+  the GPU close to its frame budget. The rest of the gap to cp6 is the canvas
+  API itself: cp6's bench draws a circle with one `circle()` call, where a
+  canvas takes `beginPath`, `arc`, `fill` and `stroke`, and `save`/`restore`
+  carry the whole canvas state.
 
 ## API beyond the original
 
@@ -248,7 +352,8 @@ Where the time went:
 - Opaque image texels are copied in runs.
 - Smooth stretches of a stroke become one ribbon contour; a stroked circle is
   two rings rather than hundreds of overlapping pieces.
-- `Window::present()` uploads the canvas without copying it.
+- `Window::present()` uploads the canvas without copying it (software
+  path), or shows the GPU canvas's texture with nothing to upload.
 
 ## SVG
 
@@ -273,6 +378,12 @@ The compiler supports:
 - **`canvas.h`, `canvas.cpp`:** the API, and the native and web backends.
   - `detail/soft*.h` holds the native internals: the drawing model,
     shaders, the display list and culling.
+  - `detail/gpu.h` holds the GPU path, native and WebGL2: the OpenGL calls,
+    shaders, tiling and the hand-over to the rasterizer for what it does
+    not draw.
+  - `detail/webgpu.h` holds the browser's GPU canvas: the path built in
+    device space, clips, text and images, and the replays onto a hidden 2D
+    canvas.
   - `detail/raster.h` holds the scan converter and thread pool.
   - `detail/web*.h` holds the browser backend: the op stream, culling and
     page-side JavaScript.
@@ -287,6 +398,8 @@ The compiler supports:
   window and input layer.
 - **`tests/`:** native tests, the conformance scenes and the benchmark.
 - **`tools/conformance/`:** the comparison against Chrome.
+- **`tools/gpu_check/`:** the comparison of the GPU path against the
+  software renderer.
 
 Painting is single-threaded per process. Draw from one thread, as in a
 browser; the library spreads each flush across the cores itself.

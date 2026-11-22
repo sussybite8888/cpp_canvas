@@ -543,4 +543,40 @@ inline void bitmapText(const std::string& text, float x, float y, float size, st
     }
 }
 
+// An integer device box: [x0, x1) x [y0, y1).
+struct IBox {
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool empty() const { return x0 >= x1 || y0 >= y1; }
+    IBox intersect(const IBox& o) const { return {std::max(x0, o.x0), std::max(y0, o.y0), std::min(x1, o.x1), std::min(y1, o.y1)}; }
+    IBox outset(int l, int t, int r, int b) const { return {x0 - l, y0 - t, x1 + r, y1 + b}; }
+    long long area() const { return empty() ? 0 : static_cast<long long>(x1 - x0) * (y1 - y0); }
+};
+inline IBox toIBox(const Box& b) {
+    if (b.empty()) return {};
+    const auto c = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
+    return {c(std::floor(b.x0)), c(std::floor(b.y0)), c(std::ceil(b.x1)) + 1, c(std::ceil(b.y1)) + 1};
+}
+
+struct ImageCopy {
+    std::vector<std::uint8_t> rgba;
+    int w = 0, h = 0;
+    bool opaque = false;
+};
+
+inline bool polyIsRect(const Poly& p, float& X0, float& Y0, float& X1, float& Y1) {
+    if (p.ends.size() != 1 || p.points() < 4 || p.points() > 5) return false;
+    const float* q = p.pts.data();
+    const int n = p.points();
+    X0 = std::min({q[0], q[2], q[4], q[6]}); X1 = std::max({q[0], q[2], q[4], q[6]});
+    Y0 = std::min({q[1], q[3], q[5], q[7]}); Y1 = std::max({q[1], q[3], q[5], q[7]});
+    if (n == 5 && (q[8] != q[0] || q[9] != q[1])) return false;
+    for (int i = 0; i < 4; ++i) {
+        const float x = q[2 * i], y = q[2 * i + 1];
+        if ((x != X0 && x != X1) || (y != Y0 && y != Y1)) return false;
+        const int j = (i + 1) % 4;
+        if (q[2 * i] != q[2 * j] && q[2 * i + 1] != q[2 * j + 1]) return false;  // diagonal
+    }
+    return true;
+}
+
 }  // namespace canvas_detail

@@ -36,22 +36,50 @@
 // ===========================================================================
 EM_JS(int, c2d_create, (const char* element, int width, int height, int virtualCanvas, int desynchronized), {
   Module.cppCanvasContexts ||= [];
+  Module.cppCanvasFreeIds ||= [];
+  Module.cppCanvasSpare ||= [];
   Module.cppCanvasLoss ||= {seen: false, note: () => { Module.cppCanvasLoss.seen = true; }, waited: 0, checkedAt: 0, probe: null, probedAt: 0, probeBroken: false};
-  let surface, options;
-  if (virtualCanvas) surface = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(width, height) : document.createElement('canvas');
+  let surface, options, ctx = null;
+  if (virtualCanvas) {
+    // A surface a destroyed canvas left behind: resizing it is several times
+    // cheaper than a new surface and context, and leaves nothing for the
+    // garbage collector (apps that make and drop canvases every frame).
+    const spare = Module.cppCanvasSpare.pop();
+    if (spare) {
+      Module.cppCanvasSparePixels -= spare.surface.width * spare.surface.height;
+      surface = spare.surface; ctx = spare.ctx;
+    } else surface = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(width, height) : document.createElement('canvas');
+  }
   else { const id = UTF8ToString(element); surface = document.getElementById(id) || Object.assign(document.createElement('canvas'), {id}); if (!surface.parentNode) document.body.appendChild(surface); options = {alpha: false, desynchronized: !!desynchronized}; }
+  // Setting the size clears the bitmap and resets the context's state, even
+  // when it does not change.
   surface.width = width; surface.height = height;
-  surface.addEventListener('contextlost', Module.cppCanvasLoss.note);
-  const entry = {surface, ctx: surface.getContext('2d', options), main: !virtualCanvas, layers: []};
+  if (ctx) { if (ctx.reset) ctx.reset(); }
+  else { surface.addEventListener('contextlost', Module.cppCanvasLoss.note); ctx = surface.getContext('2d', options); }
+  const entry = {surface, ctx, main: !virtualCanvas, layers: []};
   if (entry.main) Module.cppCanvasMain = entry;
-  Module.cppCanvasContexts.push(entry);
-  return Module.cppCanvasContexts.length - 1;
+  // Ids are reused, so the table does not grow with every canvas ever made.
+  // Nothing names a destroyed id: its pending draws were flushed before it went.
+  const C = Module.cppCanvasContexts, free = Module.cppCanvasFreeIds;
+  const id = free.length ? free.pop() : C.length;
+  C[id] = entry;
+  return id;
 });
 EM_JS(void, c2d_destroy, (int id), {
   const C = Module.cppCanvasContexts, entry = C && C[id];
   if (!entry) return;
-  if (!entry.main) entry.surface.removeEventListener('contextlost', Module.cppCanvasLoss.note);
   C[id] = null;
+  Module.cppCanvasFreeIds.push(id);
+  if (entry.main) return;
+  // Kept for the next virtual canvas, up to 64 surfaces and 4M pixels in all;
+  // never a lost one.
+  const S = Module.cppCanvasSpare, px = entry.surface.width * entry.surface.height;
+  Module.cppCanvasSparePixels ||= 0;
+  const lost = entry.ctx && entry.ctx.isContextLost && entry.ctx.isContextLost();
+  if (!lost && !Module.cppCanvasLoss.seen && entry.ctx && S.length < 64 && Module.cppCanvasSparePixels + px <= (4 << 20)) {
+    S.push({surface: entry.surface, ctx: entry.ctx});
+    Module.cppCanvasSparePixels += px;
+  } else entry.surface.removeEventListener('contextlost', Module.cppCanvasLoss.note);
 });
 // GPU loss: 0 fine, 1 lost, 2 lost for too long, 3 ready to rebuild. See the
 // README for the three ways a loss is noticed.
@@ -91,6 +119,7 @@ EM_JS(int, c2d_recover, (), {
   const L = Module.cppCanvasLoss;
   L.seen = false; L.waited = 0; L.probe = null; L.probedAt = 0;
   if (Module.cppCanvasImages) Module.cppCanvasImages.clear();
+  if (Module.cppCanvasSpare) { for (const e of Module.cppCanvasSpare) e.surface.removeEventListener('contextlost', L.note); Module.cppCanvasSpare = []; Module.cppCanvasSparePixels = 0; }
   let replaced = 0;
   for (const entry of Module.cppCanvasContexts) {
     if (!entry) continue;
@@ -384,8 +413,11 @@ std::unordered_map<int, Canvas*>& liveCanvases() {
 
 // What a canvas keeps of its own between batches: the generation of the
 // page's current path, which culling matches paints against.
+struct WebGpu;  // detail/webgpu.h
 struct Canvas::WebOps {
     std::int32_t pathGen = 1;
+    // Set for an element canvas drawn with WebGL2 (detail/webgpu.h).
+    std::shared_ptr<WebGpu> gpu;
 };
 
 namespace {
@@ -443,28 +475,36 @@ void releaseOps(const Canvas* c) {
     b.state = nullptr;
 }
 
-// Every canvas with something buffered, for canvasFlushOps.
-std::unordered_set<const Canvas*>& pendingCanvases() {
-    static auto* p = new std::unordered_set<const Canvas*>();
-    return *p;
+// Sends whatever is buffered, whichever canvas it belongs to: before a
+// canvas's surface goes, since the calls may read it.
+void flushOwner() {
+    OpBuffer& b = opBuffer();
+    if (b.owner && b.count > 0) flushBuffer(*b.owner);
 }
 
+// The interned strings by index (for a GPU canvas, which reads them back).
+std::vector<std::string>& internedNames() { static auto* v = new std::vector<std::string>{std::string()}; return *v; }
+// While set, interning never empties the table: the records being read name
+// strings by index.
+bool gInternLocked = false;
 std::int32_t internStyle(const char* text) {
     if (!text || !*text) return 0;
     auto& table = interned();
     const std::string key(text);
     const auto found = table.find(key);
     if (found != table.end()) return found->second;
-    if (table.size() >= kMaxInternedStrings) {
+    if (table.size() >= kMaxInternedStrings && !gInternLocked) {
         // Buffered records name strings by index: every buffer has to go
         // before the table can be dropped.
         flushAllBuffers();
         table.clear();
         table.emplace(std::string(), 0);
+        internedNames().assign(1, std::string());
         c2d_intern_reset();
     }
     const std::int32_t id = static_cast<std::int32_t>(table.size());
     table.emplace(key, id);
+    internedNames().push_back(key);
     c2d_intern(id, key.c_str());
     return id;
 }
@@ -632,10 +672,7 @@ static OpSlot* opRecord(const Canvas& c, OpBuffer& b, int code) {
   // A full buffer is flushed and `c` keeps it. Anything a caller puts in an
   // arena is placed after this, so its offset is into the arena as it is now.
   if (b.count >= kOpCapacity || b.paths.size() >= kMaxArenaFloats || b.bytes.size() >= (32u << 20)) flushBuffer(c);
-  if (b.count == 0) {
-    pendingCanvases().insert(&c);
-    c2d_schedule_flush();
-  }
+  if (b.count == 0) c2d_schedule_flush();
   OpSlot* r = b.slots.data() + static_cast<std::size_t>(b.count) * kOpSlots;
   b.meta[static_cast<std::size_t>(b.count)] = OpMeta{};
   ++b.count;
@@ -698,11 +735,37 @@ void markBox(std::vector<std::uint64_t>& occ, int w, int h, int x0, int y0, int 
 // Walks a buffer backwards and turns invisible paints into no-ops.
 int cullBuffer(OpBuffer& b, int w, int h, std::int32_t currentGen) {
   if (b.count < 2) return 0;
+  // Clamped in float first: an unbounded paint's box is +-1e30, and a float
+  // to int conversion out of range traps in WebAssembly.
+  const auto toInt = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
+  // The occlusion map covers only what this batch's occluders cover, not the
+  // whole canvas: a batch is often a handful of calls between two switches of
+  // canvas, and clearing a full-canvas map for each cost more than it saved.
+  int mx0 = w, my0 = h, mx1 = 0, my1 = 0;
+  for (int i = 0; i < b.count; ++i) {
+    const OpMeta& m = b.meta[static_cast<std::size_t>(i)];
+    if (m.kind != 1 || !(m.ox0 < m.ox1 && m.oy0 < m.oy1)) continue;
+    mx0 = std::min(mx0, std::max(0, m.ox0)); my0 = std::min(my0, std::max(0, m.oy0));
+    mx1 = std::max(mx1, std::min(w, m.ox1)); my1 = std::max(my1, std::min(h, m.oy1));
+  }
+  const bool occluders = mx0 < mx1 && my0 < my1;
+  const int mw = occluders ? mx1 - mx0 : 0, mh = occluders ? my1 - my0 : 0;
   bool any = false;
   int culled = 0;
   // Page-path generations some surviving record still needs -- always the
-  // current one, which a paint in the NEXT buffer may still use.
-  std::unordered_set<std::int32_t> livePaths{currentGen};
+  // current one, which a paint in the NEXT buffer may still use. A batch's
+  // generations run from its first path to `currentGen` (a new one per
+  // beginPath), so a flag per generation in that range.
+  std::int32_t firstGen = currentGen;
+  for (int i = 0; i < b.count; ++i) {
+    const OpMeta& m = b.meta[static_cast<std::size_t>(i)];
+    if (m.kind == 2 || m.usesPagePath) { firstGen = std::min(firstGen, m.pathGen); break; }
+  }
+  static std::vector<unsigned char> livePaths;
+  livePaths.assign(static_cast<std::size_t>(currentGen - firstGen) + 1, 0);
+  livePaths.back() = 1;
+  const auto live = [&](std::int32_t g) { return g < firstGen || g > currentGen || livePaths[static_cast<std::size_t>(g - firstGen)]; };
+  const auto keep = [&](std::int32_t g) { if (g >= firstGen && g <= currentGen) livePaths[static_cast<std::size_t>(g - firstGen)] = 1; };
   int layerDepth = 0;  // walking backwards: inside a layer while > 0
   for (int i = b.count - 1; i >= 0; --i) {
     OpMeta& m = b.meta[static_cast<std::size_t>(i)];
@@ -712,30 +775,29 @@ int cullBuffer(OpBuffer& b, int w, int h, std::int32_t currentGen) {
     if (code == 59 && layerDepth > 0) --layerDepth;
     if (m.kind == 2) {
       // Path building: dropped with its generation when nothing uses it.
-      if (!livePaths.count(m.pathGen)) { r[0].i = kNop; }
+      if (!live(m.pathGen)) { r[0].i = kNop; }
       continue;
     }
     if (m.kind != 1 || layerDepth > 0) {
-      if (m.usesPagePath) livePaths.insert(m.pathGen);
+      if (m.usesPagePath) keep(m.pathGen);
       continue;
     }
-    // Clamped in float first: an unbounded paint's box is +-1e30, and a float
-    // to int conversion out of range traps in WebAssembly.
-    const auto toInt = [](float v) { return static_cast<int>(std::clamp(v, -1e8f, 1e8f)); };
     const int x0 = std::max(0, toInt(std::floor(m.x0))), y0 = std::max(0, toInt(std::floor(m.y0)));
     const int x1 = std::min(w, toInt(std::ceil(m.x1)) + 1), y1 = std::min(h, toInt(std::ceil(m.y1)) + 1);
     const bool emptyBox = x0 >= x1 || y0 >= y1;
-    if (emptyBox || (any && boxCovered(b.occlusion, w, x0, y0, x1, y1))) {
+    // Covered only if the box lies inside the map, and the map says so.
+    const bool inMap = any && x0 >= mx0 && y0 >= my0 && x1 <= mx1 && y1 <= my1;
+    if (emptyBox || (inMap && boxCovered(b.occlusion, mw, x0 - mx0, y0 - my0, x1 - mx0, y1 - my0))) {
       ++culled;
       if (m.keepsPath) r[1].f = 3.f;               // keep the geometry, skip the paint
       else if (m.tempImage) r[0].i = 57;            // just drop the upload
       else r[0].i = kNop;
       continue;
     }
-    if (m.usesPagePath) livePaths.insert(m.pathGen);
-    if (m.ox0 < m.ox1 && m.oy0 < m.oy1) {
-      if (!any) { b.occlusion.assign(static_cast<std::size_t>((w + 63) / 64) * h, 0); any = true; }
-      markBox(b.occlusion, w, h, m.ox0, m.oy0, m.ox1, m.oy1);
+    if (m.usesPagePath) keep(m.pathGen);
+    if (occluders && m.ox0 < m.ox1 && m.oy0 < m.oy1) {
+      if (!any) { b.occlusion.assign(static_cast<std::size_t>((mw + 63) / 64) * mh, 0); any = true; }
+      markBox(b.occlusion, mw, mh, m.ox0 - mx0, m.oy0 - my0, m.ox1 - mx0, m.oy1 - my0);
     }
   }
   return culled;
@@ -764,10 +826,10 @@ void canvasFlushOps() { flushAllBuffers(); }
 extern "C" EMSCRIPTEN_KEEPALIVE void cpp_canvas_flush_all() { flushAllBuffers(); }
 
 namespace {
+void presentGpuCanvases();
 void flushAllBuffers() {
-  // Flushing one canvas can flush others (its readers); take a copy.
-  std::vector<const Canvas*> all(pendingCanvases().begin(), pendingCanvases().end());
-  for (const Canvas* c : all) if (pendingCanvases().count(c)) flushBuffer(*c);
+  flushOwner();
+  presentGpuCanvases();
   // Page objects nothing can name any more.
   for (const std::string& name : droppedObjects()) c2d_object_drop(name.c_str());
   droppedObjects().clear();
@@ -776,14 +838,30 @@ void flushAllBuffers() {
 }
 }  // namespace
 
+#include <optional>
+#include "webgpu.h"
+
 // ===========================================================================
 // Canvas: construction.
 // ===========================================================================
 Canvas::Canvas(int w, int h, std::string id, bool desynchronized)
     : width_(std::max(1, w)), height_(std::max(1, h)), elementId_(std::move(id)), logicalWidth_(width_), logicalHeight_(height_) {
-  contextId_ = c2d_create(elementId_.c_str(), width_, height_, 0, desynchronized ? 1 : 0);
-  liveCanvases()[contextId_] = this;
   ops_ = std::make_unique<WebOps>();
+  // WebGL2 when the page has it: the element is the GPU's, and the canvas's
+  // 2D context a hidden surface of its own for what the GPU replays.
+  if (!desynchronized && c2d_gpu_wanted()) {
+    contextId_ = c2d_create("", width_, height_, 1, 0);
+    auto gpu = std::make_shared<WebGpu>();
+    if (gpu->init(elementId_, width_, height_, contextId_)) {
+      ops_->gpu = gpu;
+      gpuCanvases()[this] = gpu.get();
+    } else {
+      c2d_destroy(contextId_);
+      contextId_ = -1;
+    }
+  }
+  if (contextId_ < 0) contextId_ = c2d_create(elementId_.c_str(), width_, height_, 0, desynchronized ? 1 : 0);
+  liveCanvases()[contextId_] = this;
 }
 Canvas::Canvas(int w, int h, bool virtualCanvas)
     : width_(std::max(1, w)), height_(std::max(1, h)), virtual_(virtualCanvas), logicalWidth_(width_), logicalHeight_(height_) {
@@ -801,7 +879,6 @@ Canvas::Canvas(Canvas&& o) noexcept
       currentPath_(std::move(o.currentPath_)), tint_(o.tint_), cullingEnabled_(o.cullingEnabled_) {
   // Everything that names the old object by address goes first.
   o.flush();
-  o.dropDependencies();
   releaseOps(&o);
   o.contextId_ = -1;
   if (contextId_ >= 0) liveCanvases()[contextId_] = this;
@@ -813,13 +890,14 @@ Canvas::Canvas(Canvas&& o) noexcept
   layerDepth_ = o.layerDepth_;
   ops_ = std::move(o.ops_);
   o.ops_ = std::make_unique<WebOps>();
+  gpuCanvases().erase(&o);
+  if (ops_->gpu) gpuCanvases()[this] = ops_->gpu.get();
 }
 Canvas& Canvas::operator=(Canvas&& o) noexcept {
   if (this == &o) return *this;
-  if (contextId_ >= 0) { flush(); dropDependencies(); c2d_destroy(contextId_); liveCanvases().erase(contextId_); }
+  if (contextId_ >= 0) { flushOwner(); c2d_destroy(contextId_); liveCanvases().erase(contextId_); }
   releaseOps(this);
   o.flush();
-  o.dropDependencies();
   releaseOps(&o);
   width_ = o.width_; height_ = o.height_; contextId_ = o.contextId_; virtual_ = o.virtual_;
   elementId_ = std::move(o.elementId_); fill_ = o.fill_; stroke_ = o.stroke_; lineWidth_ = o.lineWidth_;
@@ -832,45 +910,36 @@ Canvas& Canvas::operator=(Canvas&& o) noexcept {
   pathMode_ = o.pathMode_; pagePathDirty_ = o.pagePathDirty_; pagePathSegments_ = o.pagePathSegments_; pathMatrix_ = o.pathMatrix_;
   pathHasSubpath_ = o.pathHasSubpath_; pageSeamMoved_ = o.pageSeamMoved_; pathUniform_ = o.pathUniform_;
   layerDepth_ = o.layerDepth_;
+  gpuCanvases().erase(this);
   ops_ = std::move(o.ops_);
   o.ops_ = std::make_unique<WebOps>();
+  gpuCanvases().erase(&o);
+  if (ops_->gpu) gpuCanvases()[this] = ops_->gpu.get();
   return *this;
 }
 Canvas::~Canvas() {
+  // Whatever is buffered -- this canvas's calls, or another's that read it --
+  // goes before the surface does.
   if (contextId_ >= 0) {
-    flush();
-    dropDependencies();
+    flushOwner();
     c2d_destroy(contextId_);
     liveCanvases().erase(contextId_);
   }
+  gpuCanvases().erase(this);
   releaseOps(this);
-  pendingCanvases().erase(this);
 }
 void Canvas::present(const std::string& id) {
   flush();
+  if (ops_->gpu) ops_->gpu->syncShadow();
   c2d_present(contextId_, id.c_str());
 }
 
 // ----- dependencies -----
-void Canvas::dependOn(const Canvas& source) const {
-  if (&source == this) return;
-  const_cast<Canvas&>(source).flush();
-  if (std::find(source.readers_.begin(), source.readers_.end(), this) == source.readers_.end()) source.readers_.push_back(this);
-  if (std::find(sources_.begin(), sources_.end(), &source) == sources_.end()) sources_.push_back(&source);
-}
-void Canvas::beforeWrite() const {
-  // Canvases whose buffered ops read this one read it as it is NOW.
-  std::vector<const Canvas*> rs;
-  rs.swap(readers_);
-  for (const Canvas* r : rs) if (r != this) const_cast<Canvas*>(r)->flush();
-}
-void Canvas::dropDependencies() const {
-  for (const Canvas* s : sources_) {
-    auto& rs = s->readers_;
-    rs.erase(std::remove(rs.begin(), rs.end(), this), rs.end());
-  }
-  sources_.clear();
-  beforeWrite();
-}
+// With one buffer there is nothing to track: a canvas that records while
+// another holds the buffer flushes it first, so calls reach the page in the
+// order they were made, reads included.
+void Canvas::dependOn(const Canvas&) const {}
+void Canvas::beforeWrite() const {}
+void Canvas::dropDependencies() const {}
 
 #include "web_canvas.h"

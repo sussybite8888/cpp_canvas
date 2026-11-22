@@ -58,6 +58,9 @@ if(EMSCRIPTEN)
       ${CPP_CANVAS_SKIA_DIR}/libjpeg.wasm.a ${CPP_CANVAS_SKIA_DIR}/libwebp.wasm.a ${CPP_CANVAS_SKIA_DIR}/libwuffs.wasm.a
       ${CPP_CANVAS_SKIA_DIR}/libskcms.wasm.a ${CPP_CANVAS_SKIA_DIR}/libexpat.wasm.a ${CPP_CANVAS_SKIA_DIR}/libzlib.wasm.a)
     target_link_options(cpp_canvas PUBLIC "-sMAX_WEBGL_VERSION=2" "-sSUPPORT_LONGJMP=wasm" "-fno-exceptions")
+  else()
+    # Element canvases are drawn with WebGL2 (detail/webgpu.h).
+    target_link_options(cpp_canvas PUBLIC "-sMAX_WEBGL_VERSION=2")
   endif()
 else()
   find_package(PkgConfig REQUIRED)

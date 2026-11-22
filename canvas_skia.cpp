@@ -1645,6 +1645,7 @@ void Canvas::rect(float a,float b,float c,float d) { SEGMENT(Rect, a, b, c, d); 
 void Canvas::roundRect(float a,float b,float c,float d,float e) { SEGMENT(RoundRect, a, b, c, d, e); }
 #undef SEGMENT
 
+void Canvas::fill() { fill(std::string("nonzero")); }
 void Canvas::fill(const std::string& rule) {
   countOp(44);
   SkiaCanvas& c = *skia_;
