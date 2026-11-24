@@ -244,6 +244,25 @@ EM_JS(void, c2d_measure, (const char* font, const char* text, const char* letter
              m.fontBoundingBoxAscent, m.fontBoundingBoxDescent, m.emHeightAscent, m.emHeightDescent, m.hangingBaseline, m.alphabeticBaseline, m.ideographicBaseline];
   for (let i = 0; i < v.length; i++) HEAPF32[o + i] = +v[i] || 0;
 });
+// A canvas read back again and again is better kept where reading is cheap:
+// on its third read, a virtual canvas's surface is replaced by a copy made
+// with willReadFrequently (its context state starts over; the caller asks
+// only when that state is the default). 1 if it was replaced.
+EM_JS(int, c2d_make_readable, (int id), {
+  const e = Module.cppCanvasContexts[id];
+  if (!e || e.main || e.readable || !e.ctx) return 0;
+  e.reads = (e.reads || 0) + 1;
+  if (e.reads < 3) return 0;
+  const old = e.surface, w = old.width, h = old.height;
+  const surface = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), {width: w, height: h});
+  const ctx = surface.getContext('2d', {willReadFrequently: true});
+  if (!ctx) return 0;
+  ctx.drawImage(old, 0, 0);
+  old.removeEventListener && old.removeEventListener('contextlost', Module.cppCanvasLoss.note);
+  surface.addEventListener && surface.addEventListener('contextlost', Module.cppCanvasLoss.note);
+  e.surface = surface; e.ctx = ctx; e.readable = true; e.layers = [];
+  return 1;
+});
 EM_JS(int, c2d_get_pixels, (int id,int x,int y,int w,int h,std::uint8_t* out), { const e=Module.cppCanvasContexts[id]; const c=e&&e.ctx; if (!c) return 0; const d=c.getImageData(x,y,w,h).data; HEAPU8.set(d,out); return d.length; });
 // Uploads pixels as a drawable surface under `key` (no context is touched, so
 // nothing has to flush). The C++ side decides what stays and what goes.

@@ -1236,6 +1236,16 @@ std::vector<std::uint8_t> Canvas::getImageData(int a, int b, int c, int d) const
   if (r.empty()) return r;
   const_cast<Canvas*>(this)->flush();
   if (ops_->gpu) return ops_->gpu->readPixels(a, b, c, d);
+  // Read back again and again: moved to a surface kept for reading, when its
+  // context holds nothing but defaults to lose (no saves, clip, layer or
+  // path sent); the mirror of that context starts over with it.
+  if (virtual_ && appliedStack_.empty() && !web_.clipped && layerDepth_ == 0 && pathMode_ != PathMode::Sent && c2d_make_readable(contextId_)) {
+    Canvas& self = const_cast<Canvas&>(*this);
+    self.applied_ = WebState{};
+    self.dirty_ = kAllStateBits;
+    self.frameKnown_ = false;
+    self.pagePathDirty_ = false; self.pagePathSegments_ = 0; self.pageSeamMoved_ = false;
+  }
   c2d_get_pixels(contextId_, a, b, c, d, r.data());
   return r;
 }

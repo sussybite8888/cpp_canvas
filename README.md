@@ -177,7 +177,14 @@ geometry is still this library's: paths are flattened, and strokes outlined
 In the browser, a canvas on a page element draws with WebGL2 when the
 browser has it. It is on by default. `?canvas-gpu=0` in the page URL, or
 `Module.cppCanvasGpu = false` before the module starts, turns it off.
-Virtual canvases still use the browser's 2D canvas.
+It needs the program linked with `-sMAX_WEBGL_VERSION=2` (cpp_canvas's
+CMake target adds it). A program built from the sources without that flag
+draws with the browser's 2D canvas.
+
+Virtual canvases still use the browser's 2D canvas. A virtual canvas read
+back with `getImageData` a third time moves to a surface the browser keeps
+for reading (`willReadFrequently`). Its pixels are kept, and a read no
+longer waits for the GPU.
 
 - **How it draws:** as cp6 does, and with its approximations.
   - The current path is built in device space as it is made. Arcs and curves

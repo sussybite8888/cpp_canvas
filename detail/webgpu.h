@@ -28,6 +28,7 @@ EM_JS(int, c2d_gpu_wanted, (), {
   if (typeof location !== 'undefined' && /[?&]canvas-gpu=0/.test(location.search)) return 0;
   return typeof WebGL2RenderingContext !== 'undefined' ? 1 : 0;
 });
+EM_JS(int, c2d_gpu_is_webgl2, (), { return typeof WebGL2RenderingContext !== 'undefined' && GLctx instanceof WebGL2RenderingContext ? 1 : 0; });
 // The element, sized: it is the WebGL canvas.
 // The element replaced by a fresh copy: a WebGL context the GPU could not
 // use would otherwise keep it from ever having a 2D one.
@@ -70,7 +71,9 @@ EM_JS(int, c2d_gpu_surface_texture, (int kind, int key, int tex, int* size), {
   else source = Module.cppCanvasImages && Module.cppCanvasImages.get(key);
   if (!source || !gl || !source.width || !source.height) return 0;
   gl.bindTexture(gl.TEXTURE_2D, GL.textures[tex]);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  // The same size as the texture holds: its storage kept, the pixels replaced.
+  if (HEAP32[size >> 2] === source.width && HEAP32[(size >> 2) + 1] === source.height) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
   HEAP32[size >> 2] = source.width; HEAP32[(size >> 2) + 1] = source.height;
   return 1;
 });
@@ -270,8 +273,13 @@ struct WebGpu {
       contexts[id] = ctx;
     }
     if (emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS) return false;
-    if (emscripten_webgl_enable_WEBGL_draw_instanced_base_vertex_base_instance(ctx))
-      G.drawBaseInstance = [](GLenum mode, GLint first, GLsizei count, GLsizei instances, GLuint base) { glDrawArraysInstancedBaseInstanceWEBGL(mode, first, count, instances, base); };
+    if (!c2d_gpu_is_webgl2()) {
+      // Linked without -sMAX_WEBGL_VERSION=2: a WebGL1 context, no use here.
+      emscripten_webgl_destroy_context(ctx);
+      contexts.erase(id);
+      c2d_gpu_release_element(id.c_str());
+      return false;
+    }
     std::vector<Color> blank(static_cast<std::size_t>(w) * h, Color{0, 0, 0, 255});
     if (!G.init(nullptr, w, h, blank)) {
       emscripten_webgl_destroy_context(ctx);
@@ -343,7 +351,7 @@ struct WebGpu {
     if (t.tex && t.version == version) return &t;
     if (t.tex && pendingUses(t.tex)) G.draw();  // what was drawn from it reads it as it was
     if (!t.tex) t.tex = G.texture(gl::RGBA8, 1, 1, gl::NEAREST);
-    int size[2] = {0, 0};
+    int size[2] = {t.w, t.h};  // what the texture holds now
     if (!c2d_gpu_surface_texture(0, context, static_cast<int>(t.tex), size)) { t.version = ~0ull; return nullptr; }
     t.w = size[0]; t.h = size[1]; t.version = version;
     return &t;
@@ -955,10 +963,27 @@ struct WebGpu {
     const Paint p = strokePaint();
     if (p.kind == PaintKind::Other) return false;
     if (!usePaint(p)) return false;
+    if (p.kind == PaintKind::Solid && p.colour.a == 0) return true;
+    // Axis-aligned with square corners: the ring between two rects, exactly.
+    // (Under a pixel wide, Chrome covers a stroke differently: the long way.)
+    if (p.kind == PaintKind::Solid && rw != 0 && rh != 0 && canvas_detail::isAxisAligned(m) &&
+        ws->lineWidth * std::abs(m[0]) >= 1 && ws->lineWidth * std::abs(m[3]) >= 1 &&
+        ws->lineJoin == "miter" && ws->miterLimit >= 1.4143f) {
+      const float ax = m[0] * x + m[4], bx = m[0] * (x + rw) + m[4], ay = m[3] * y + m[5], by = m[3] * (y + rh) + m[5];
+      const float hx = ws->lineWidth * 0.5f * std::abs(m[0]), hy = ws->lineWidth * 0.5f * std::abs(m[3]);
+      const float X0 = std::min(ax, bx), X1 = std::max(ax, bx), Y0 = std::min(ay, by), Y1 = std::max(ay, by);
+      const float o[4] = {X0 - hx, Y0 - hy, X1 + hx, Y1 + hy};
+      const float in[4] = {X0 + hx, Y0 + hy, std::max(X0 + hx, X1 - hx), std::max(Y0 + hy, Y1 - hy)};
+      if (G.rectRing(o, in, style(), p.colour)) return true;
+    }
     Path2D box;
     box.rect(x, y, rw, rh);
     static thread_local Poly local;
     canvas_detail::flatten(box.segments().data(), box.segments().size(), Matrix{1, 0, 0, 1, 0, 0}, canvas_detail::matrixMaxScale(m), local);
+    // Round joins are the path stroke's own: one instance.
+    if (p.kind == PaintKind::Solid && ws->dash.empty() && ws->lineJoin == "round" && uniform(m) &&
+        G.pathLocal(local, m, false, false, Color{}, true, p.colour, ws->lineWidth * 0.5f * std::sqrt(std::abs(m[0] * m[3] - m[1] * m[2])), capOf(), style()))
+      return true;
     return strokeLocal(local, p);
   }
   bool clearRect(float x, float y, float rw, float rh) {

@@ -215,7 +215,7 @@ struct GpuInst {
 static_assert(sizeof(GpuInst) == 96, "instance layout");
 enum GpuKind { kGpuDevRect = 0, kGpuPoly = 1, kGpuImage = 2, kGpuStroke = 3, kGpuMultiply = 4, kGpuGlyph = 5, kGpuCircle = 6, kGpuPath = 7 };
 enum GpuBlend { kBlendOver = 0, kBlendClear = 1, kBlendMultiply = 2 };
-enum GpuFlags { kGpuNearest = 1, kGpuAxisAligned = 2, kGpuFillAndStroke = 4, kGpuGradient = 8, kGpuCoverage = 16, kGpuPathKept = 32, kGpuPathFill = 64, kGpuPathStroke = 128 };
+enum GpuFlags { kGpuNearest = 1, kGpuAxisAligned = 2, kGpuFillAndStroke = 4, kGpuGradient = 8, kGpuCoverage = 16, kGpuPathKept = 32, kGpuRing = 32, kGpuPathFill = 64, kGpuPathStroke = 128 };
 
 // A shelf-packed atlas, R8 or RGBA8.
 struct GpuAtlas {
@@ -735,21 +735,15 @@ struct GpuSurface {
         const long long texels = static_cast<long long>(pl.pts.size() / 2 + pl.ends.size());
         bool allClosed = true;
         for (char c : pl.closed) allClosed = allClosed && c;
-        if (texels > 20 && q.y1 - q.y0 > 2 * kBandRows && texels * q.area() > 40000 && (allClosed || !doStroke)) {
-            bandSegs.resize(4 * static_cast<std::size_t>(pl.points()));
-            float* o = bandSegs.data();
+        if (texels > 20 && std::max(q.x1 - q.x0, q.y1 - q.y0) > 2 * kBandRows && texels * q.area() > 40000) {
+            const bool flagged = doStroke && !allClosed;
+            bandSegs.clear(); bandFlags.clear();
             int first = 0;
             for (std::size_t c = 0; c < pl.ends.size(); ++c) {
-                const int last = pl.ends[c];
-                if (last - first >= 2)
-                    for (int k = first; k < last; ++k, o += 4) {
-                        const int j = k + 1 < last ? k + 1 : first;
-                        o[0] = pl.pts[2 * k]; o[1] = pl.pts[2 * k + 1]; o[2] = pl.pts[2 * j]; o[3] = pl.pts[2 * j + 1];
-                    }
-                first = last;
+                bandSubpath(pl.pts.data() + 2 * first, pl.ends[c] - first, pl.closed[c], flagged, fill);
+                first = pl.ends[c];
             }
-            bandSegs.resize(static_cast<std::size_t>(o - bandSegs.data()));
-            if (bandPath(evenOdd, fill, fc, doStroke, sc, hw, q, reach, probe, s)) return true;
+            if (bandPath(evenOdd, fill, fc, doStroke, sc, hw, cap, flagged, q, reach, probe, s)) return true;
         }
         if (texels * q.area() > kPathBudget) return false;
         int slots = 0;
@@ -771,22 +765,11 @@ struct GpuSurface {
         const IBox q = IBox{clampI(std::floor(t.x0 - reach)), clampI(std::floor(t.y0 - reach)), clampI(std::ceil(t.x1 + reach)), clampI(std::ceil(t.y1 + reach))}.intersect(limit);
         if (q.empty()) return true;
         const long long texels = static_cast<long long>(floats / 2);  // slots, as texels count for the budget
-        if (texels > 20 && q.y1 - q.y0 > 2 * kBandRows && texels * q.area() > 40000 && (t.allClosed() || !doStroke)) {
-            bandSegs.resize(2 * floats);
-            float* o = bandSegs.data();
-            for (std::size_t i = 0; i < floats;) {
-                const int k = static_cast<int>(t.buf[i]);
-                const float* p0 = t.buf.data() + i + 2;
-                for (int j = 0; j < k; ++j, o += 4) {
-                    const float* a = p0 + 2 * j;
-                    const float* b = p0 + 2 * (j + 1 < k ? j + 1 : 0);
-                    o[0] = a[0]; o[1] = a[1]; o[2] = b[0]; o[3] = b[1];
-                }
-                i += 2 * (static_cast<std::size_t>(k) + 1);
-            }
-            bandSegs.resize(static_cast<std::size_t>(o - bandSegs.data()));
+        if (texels > 20 && std::max(q.x1 - q.x0, q.y1 - q.y0) > 2 * kBandRows && texels * q.area() > 40000) {
+            const bool flagged = doStroke && !t.allClosed();
+            bandSlots(t.buf.data(), floats, flagged, fill);
             if (!s.clip) { probe = GpuInst{}; setClip(probe, s, limit); }
-            if (bandPath(evenOdd, fill, fc, doStroke, sc, hw, q, reach, probe, s)) return true;
+            if (bandPath(evenOdd, fill, fc, doStroke, sc, hw, cap, flagged, q, reach, probe, s)) return true;
         }
         if (texels * q.area() > kPathBudget) return false;
         const std::size_t at = edges.size();
@@ -832,24 +815,13 @@ struct GpuSurface {
         const IBox q = IBox{clampI(std::floor(bx0 - reach)), clampI(std::floor(by0 - reach)), clampI(std::ceil(bx1 + reach)), clampI(std::ceil(by1 + reach))}.intersect(limit);
         if (q.empty()) { undo(); return true; }
         const long long texels = static_cast<long long>(used / 2);
-        if (texels > 20 && q.y1 - q.y0 > 2 * kBandRows && texels * q.area() > 40000 && (allClosed || !doStroke)) {
+        if (texels > 20 && std::max(q.x1 - q.x0, q.y1 - q.y0) > 2 * kBandRows && texels * q.area() > 40000) {
             // Its segments, from what was just written; then the bands instead.
-            bandSegs.resize(2 * used);
-            float* g = bandSegs.data();
-            for (std::size_t i = 0; i < used;) {
-                const int k = static_cast<int>(edges[at + i]);
-                const float* p0 = edges.data() + at + i + 2;
-                for (int j = 0; j < k; ++j, g += 4) {
-                    const float* a = p0 + 2 * j;
-                    const float* b = p0 + 2 * (j + 1 < k ? j + 1 : 0);
-                    g[0] = a[0]; g[1] = a[1]; g[2] = b[0]; g[3] = b[1];
-                }
-                i += 2 * (static_cast<std::size_t>(k) + 1);
-            }
-            bandSegs.resize(static_cast<std::size_t>(g - bandSegs.data()));
+            const bool flagged = doStroke && !allClosed;
+            bandSlots(edges.data() + at, used, flagged, fill);
             undo();
             if (!s.clip) { probe = GpuInst{}; setClip(probe, s, limit); }
-            return bandPath(evenOdd, fill, fc, doStroke, sc, hw, q, reach, probe, s);
+            return bandPath(evenOdd, fill, fc, doStroke, sc, hw, cap, flagged, q, reach, probe, s);
         }
         if (texels * q.area() > kPathBudget) { undo(); return false; }
         edges.resize(at + ((used + 3) & ~static_cast<std::size_t>(3)));
@@ -876,23 +848,55 @@ struct GpuSurface {
     // A path cut into bands of rows, each with only the segments that reach
     // it: a row's winding needs only the segments crossing it, and coverage
     // only those within reach.
-    std::vector<float> bandSegs;
+    // A stroke with open subpaths has a second texel per segment
+    // (bandFlags): (starts an open subpath, ends one, only filled, 0) -- the
+    // caps, and the closing segment a fill adds that is not stroked.
+    std::vector<float> bandSegs, bandFlags;
     std::vector<int> bandCount, bandRange;
-    bool bandPath(bool evenOdd, bool fill, Color fc, bool doStroke, Color sc, float hw, const IBox& q, float reach, const GpuInst& probe, const GpuStyle& s) {
+    void bandSeg(const float* a, const float* b, bool flagged, float start, float end, float fillOnly) {
+        bandSegs.insert(bandSegs.end(), {a[0], a[1], b[0], b[1]});
+        if (flagged) bandFlags.insert(bandFlags.end(), {start, end, fillOnly, 0.f});
+    }
+    // One subpath of `k` points (x y pairs) into bandSegs.
+    void bandSubpath(const float* p, int k, bool closed, bool flagged, bool fill) {
+        if (k < 2) return;
+        if (!flagged || closed) {
+            for (int j = 0; j < k; ++j) bandSeg(p + 2 * j, p + 2 * (j + 1 < k ? j + 1 : 0), flagged, 0, 0, 0);
+            return;
+        }
+        for (int j = 0; j + 1 < k; ++j) bandSeg(p + 2 * j, p + 2 * j + 2, true, j == 0 ? 1.f : 0.f, j + 2 == k ? 1.f : 0.f, 0);
+        if (fill) bandSeg(p + 2 * (k - 1), p, true, 0, 0, 1);
+    }
+    // Every subpath of a path in slots (GpuTexPath's layout) into bandSegs.
+    void bandSlots(const float* buf, std::size_t floats, bool flagged, bool fill) {
+        bandSegs.clear(); bandFlags.clear();
+        for (std::size_t i = 0; i < floats;) {
+            const int k = static_cast<int>(buf[i]);
+            bandSubpath(buf + i + 2, k, buf[i + 1] > 0.5f, flagged, fill);
+            i += 2 * (static_cast<std::size_t>(k) + 1);
+        }
+    }
+    static constexpr std::size_t kBandTexels = 1u << 20;  // the most one path's bands take
+    bool bandPath(bool evenOdd, bool fill, Color fc, bool doStroke, Color sc, float hw, int cap, bool flagged, const IBox& q, float reach, const GpuInst& probe, const GpuStyle& s) {
         const std::size_t nseg = bandSegs.size() / 4;
-        if (nseg * 4 * (q.area() / std::max(1, q.x1 - q.x0)) > static_cast<std::size_t>(kPathBudget)) return false;
+        const std::size_t per = flagged ? 2 : 1;  // texels a segment takes
         // Each segment counted into the bands it reaches, then written there:
-        // a header texel per band, then its segments, a texel each.
-        const int bands = (q.y1 - q.y0 + kBandRows - 1) / kBandRows;
+        // a header texel per band, then its segments, a texel each. Bands
+        // are rows, or columns for a path wider than tall (a line of text).
+        const bool columns = q.x1 - q.x0 > q.y1 - q.y0;
+        const int a0 = columns ? q.x0 : q.y0, a1 = columns ? q.x1 : q.y1;
+        const int c0 = columns ? 1 : 0;  // the coordinate bands cut along: x (0) of a point or y (1)
+        const int bands = (a1 - a0 + kBandRows - 1) / kBandRows;
         // Each segment's bands, once: (b0, b1), b0 > b1 when it reaches none.
-        const float top = static_cast<float>(q.y0), bottom = static_cast<float>(q.y1), inv = 1.f / kBandRows;
+        const float top = static_cast<float>(a0), bottom = static_cast<float>(a1), inv = 1.f / kBandRows;
         const float last = static_cast<float>(bands - 1);
         bandRange.resize(2 * nseg);
         bandCount.assign(static_cast<std::size_t>(bands) + 1, 0);
         const float* g = bandSegs.data();
         int* r = bandRange.data();
         for (std::size_t k = 0; k < nseg; ++k, g += 4, r += 2) {
-            const float lo = std::min(g[1], g[3]) - reach, hi = std::max(g[1], g[3]) + reach;
+            const float u0 = g[1 - c0], u1 = g[3 - c0];
+            const float lo = std::min(u0, u1) - reach, hi = std::max(u0, u1) + reach;
             if (hi < top || lo > bottom) { r[0] = 1; r[1] = 0; continue; }
             r[0] = static_cast<int>(std::min(std::max(lo - top, 0.f) * inv, last));
             r[1] = static_cast<int>(std::min(std::max(hi - top, 0.f) * inv, last));
@@ -904,8 +908,9 @@ struct GpuSurface {
         for (int b = 0; b < bands; ++b) {
             const int c = bandCount[static_cast<std::size_t>(b)];
             bandCount[static_cast<std::size_t>(b)] = c ? static_cast<int>(total) : -1;
-            if (c) total += 1 + static_cast<std::size_t>(c);
+            if (c) total += 1 + per * static_cast<std::size_t>(c);
         }
+        if (total > kBandTexels) return false;
         edges.resize(edges.size() + total * 4);
         float* E = edges.data() + base * 4;
         static thread_local std::vector<int> fillAt;
@@ -914,8 +919,9 @@ struct GpuSurface {
         r = bandRange.data();
         for (std::size_t k = 0; k < nseg; ++k, g += 4, r += 2) {
             for (int b = r[0]; b <= r[1]; ++b) {
-                const std::size_t at = static_cast<std::size_t>(bandCount[static_cast<std::size_t>(b)]) + 1 + static_cast<std::size_t>(fillAt[static_cast<std::size_t>(b)]++);
+                const std::size_t at = static_cast<std::size_t>(bandCount[static_cast<std::size_t>(b)]) + 1 + per * static_cast<std::size_t>(fillAt[static_cast<std::size_t>(b)]++);
                 std::memcpy(E + at * 4, g, 4 * sizeof(float));
+                if (flagged) std::memcpy(E + (at + 1) * 4, bandFlags.data() + 4 * k, 4 * sizeof(float));
             }
         }
         for (int b = 0; b < bands; ++b) {
@@ -923,16 +929,18 @@ struct GpuSurface {
             if (start < 0) continue;
             const int n = fillAt[static_cast<std::size_t>(b)];
             float* h = E + static_cast<std::size_t>(start) * 4;
-            h[0] = static_cast<float>(n); h[1] = 2.f; h[2] = 0; h[3] = 0;
+            // 2 rows, 3 rows with flags, 4 columns, 5 columns with flags.
+            h[0] = static_cast<float>(n); h[1] = (flagged ? 3.f : 2.f) + (columns ? 2.f : 0.f); h[2] = 0; h[3] = 0;
             const int at = static_cast<int>(base) + start;
-            const int y0 = q.y0 + b * kBandRows, y1 = std::min(q.y1, y0 + kBandRows);
+            const int b0 = a0 + b * kBandRows, b1 = std::min(a1, b0 + kBandRows);
+            const int y0 = columns ? q.y0 : b0, y1 = columns ? q.y1 : b1, x0 = columns ? b0 : q.x0, x1 = columns ? b1 : q.x1;
             GpuInst& i = push();
             i = probe; stamp(i); identity(i);
             i.kind = kGpuPath;
             i.flags = static_cast<float>((fill ? kGpuPathFill : 0) | (doStroke ? kGpuPathStroke : 0));
             i.e = hw;
-            i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(y1);
-            i.p[0] = static_cast<float>(2 * at); i.p[1] = static_cast<float>(2 * n + 2); i.p[2] = evenOdd ? 1.f : 0.f; i.p[3] = 0;
+            i.quad[0] = static_cast<float>(x0); i.quad[1] = static_cast<float>(y0); i.quad[2] = static_cast<float>(x1); i.quad[3] = static_cast<float>(y1);
+            i.p[0] = static_cast<float>(2 * at); i.p[1] = static_cast<float>(2 * static_cast<int>(per) * n + 2); i.p[2] = evenOdd ? 1.f : 0.f; i.p[3] = static_cast<float>(cap);
             i.img[0] = sc.r; i.img[1] = sc.g; i.img[2] = sc.b; i.img[3] = sc.a;
             i.alpha = s.alpha; i.colour = pack(fc);
         }
@@ -1155,6 +1163,27 @@ struct GpuSurface {
         emit(IBox{q.x0, inner.y1, q.x1, q.y1}, false);
         emit(IBox{q.x0, inner.y0, inner.x0, inner.y1}, false);
         emit(IBox{inner.x1, inner.y0, q.x1, inner.y1}, false);
+        return true;
+    }
+    // The ring between device rects `o` and `i` (inside it), covered exactly
+    // (by area): an axis-aligned stroke of a rect with miter joins.
+    bool rectRing(const float* o, const float* in, const GpuStyle& s, Color c) {
+        if (paintRow >= 0) return false;  // (its inner rect takes the gradient's place)
+        GpuInst probe;
+        IBox limit;
+        if (s.clip) { probe = GpuInst{}; if (!setClip(probe, s, limit)) return false; }
+        else limit = limitOf(s);
+        const IBox q = IBox{static_cast<int>(std::floor(o[0])), static_cast<int>(std::floor(o[1])), static_cast<int>(std::ceil(o[2])), static_cast<int>(std::ceil(o[3]))}.intersect(limit);
+        if (q.empty()) return true;
+        GpuInst& i = push();
+        if (s.clip) i = probe;
+        else { IBox l; setClip(i, s, l); }
+        stamp(i);
+        i.m[0] = in[0]; i.m[1] = in[1]; i.m[2] = in[2]; i.m[3] = in[3]; i.e = 0; i.f = 0;
+        i.kind = kGpuDevRect; i.flags = kGpuRing;
+        i.quad[0] = static_cast<float>(q.x0); i.quad[1] = static_cast<float>(q.y0); i.quad[2] = static_cast<float>(q.x1); i.quad[3] = static_cast<float>(q.y1);
+        i.p[0] = o[0]; i.p[1] = o[1]; i.p[2] = o[2]; i.p[3] = o[3];
+        i.alpha = s.alpha; i.colour = pack(c);
         return true;
     }
     // True for one closed contour that is convex: its winding is 0 or 1
@@ -2052,7 +2081,8 @@ void main() {
     fDev = vec4(min(min(c0, c1), min(c2, c3)), max(max(c0, c1), max(c2, c3)));
   } else {
     dev = mix(aQuad.xy, aQuad.zw, corner);
-    fDev = vec4(aEF.x, 0.0, 0.0, 0.0);
+    // (A rect ring's inner rect rides in the matrix: rects have no other use for it.)
+    fDev = kind == 0 ? aM : vec4(aEF.x, 0.0, 0.0, 0.0);
   }
   float det = aM.x * aM.w - aM.y * aM.z;
   mat2 inv = abs(det) > 1e-20 ? inverse(M) : mat2(0.0);
@@ -2069,13 +2099,20 @@ flat in vec4 fInv; flat in vec2 fInvT; flat in vec4 fQuad; flat in vec4 fDev; fl
 uniform sampler2D uMask;
 out vec4 o;
 float span(float a0, float a1, float lo, float hi) { return clamp(min(a1, hi) - max(a0, lo), 0.0, 1.0); }
+// A rect ring (strokeRect): outer rect fP less inner rect fDev, each by the
+// distance to its nearest edge, as Chrome strokes a rect.
+float ringCoverage(vec2 c) {
+  vec4 o = vec4(c - fP.xy, fP.zw - c), i = vec4(c - fDev.xy, fDev.zw - c);
+  float a = clamp(min(min(o.x, o.y), min(o.z, o.w)) + 0.5, 0.0, 1.0), b = clamp(min(min(i.x, i.y), min(i.z, i.w)) + 0.5, 0.0, 1.0);
+  return max(a - b, 0.0);
+}
 void main() {
   vec2 pix = floor(gl_FragCoord.xy);
   if (pix.x < fClip.x || pix.y < fClip.y || pix.x >= fClip.z || pix.y >= fClip.w) discard;
   float cov;
   vec4 F = vec4(fColour.rgb * fColour.a, fColour.a);
   if (int(fKind.x + 0.5) == 0) {
-    cov = span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0);
+    cov = ((int(fKind.y + 0.5) & 32) != 0 ? ringCoverage(pix + 0.5) : span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0));
   } else {
     float dc = length(pix + 0.5 - fP.xy) - fP.z;
     if ((int(fKind.y + 0.5) & 4) != 0) {
@@ -2165,17 +2202,30 @@ vec2 pathDistance(vec2 p, int off, int cnt, bool evenOdd, int cap, float hw) {
   while (i < end) {
     vec2 hd = PS(i); int n = int(hd.x + 0.5); bool closed = hd.y > 0.5;
     if (hd.y > 1.5) {
-      // A band's segments, a texel each (a.xy, b.xy), after a whole-texel header.
-      int t0 = (i >> 1) + 1;
+      // A band's segments, a texel each (a.xy, b.xy), after a whole-texel
+      // header. With open subpaths stroked (y 3), each has a second texel:
+      // (starts one, ends one, only filled).
+      // Columns (y 4, 5) hold only the segments near their own column: the
+      // winding is counted along a ray down it instead of across.
+      int type = int(hd.y + 0.5);
+      bool flagged = type == 3 || type == 5, columns = type >= 4;
+      int t0 = (i >> 1) + 1, per = flagged ? 2 : 1;
       for (int k = 0; k < n; k++) {
-        vec4 sg = PT4(t0 + k);
+        vec4 sg = PT4(t0 + per * k);
         vec2 pa = p - sg.xy, ba = sg.zw - sg.xy;
         vec2 v = pa - ba * clamp(dot(pa, ba) / max(dot(ba, ba), 1e-12), 0.0, 1.0);
         float d2 = dot(v, v);
-        dF2 = min(dF2, d2); dS2 = min(dS2, d2);
-        w += windingOf(p, sg.xy, sg.zw);
+        dF2 = min(dF2, d2);
+        if (flagged) {
+          vec4 fl = PT4(t0 + 2 * k + 1);
+          if (fl.z < 0.5) {
+            if (cap != 1 && (fl.x > 0.5 || fl.y > 0.5)) dS = min(dS, segDistance(p, sg.xy, sg.zw, cap, fl.x > 0.5, fl.y > 0.5, hw));
+            else dS2 = min(dS2, d2);
+          }
+        } else dS2 = min(dS2, d2);
+        w += columns ? windingOf(p.yx, sg.yx, sg.wz) : windingOf(p, sg.xy, sg.zw);
       }
-      i += 2 + 2 * n;
+      i += 2 + 2 * per * n;
       continue;
     }
     i++;
@@ -2238,6 +2288,13 @@ vec3 pathAt(vec2 pix, int flags) {
   return vec3(pathDistance(pix + 0.5, int(fP.x + 0.5), int(fP.y + 0.5), fP.z > 0.5, int(fP.w + 0.5), fDev.x), fDev.x);
 }
 float span(float a0, float a1, float lo, float hi) { return clamp(min(a1, hi) - max(a0, lo), 0.0, 1.0); }
+// A rect ring (strokeRect): outer rect fP less inner rect fDev, each by the
+// distance to its nearest edge, as Chrome strokes a rect.
+float ringCoverage(vec2 c) {
+  vec4 o = vec4(c - fP.xy, fP.zw - c), i = vec4(c - fDev.xy, fDev.zw - c);
+  float a = clamp(min(min(o.x, o.y), min(o.z, o.w)) + 0.5, 0.0, 1.0), b = clamp(min(min(i.x, i.y), min(i.z, i.w)) + 0.5, 0.0, 1.0);
+  return max(a - b, 0.0);
+}
 vec4 texel(ivec2 t) {
   t = clamp(t, ivec2(0), ivec2(fImg.zw) - 1);
   vec4 c = texelFetch(uImage, t + ivec2(fImg.xy), 0);
@@ -2280,7 +2337,7 @@ void main() {
     float sa = (flags & 128) != 0 ? clamp(min(r.y + 0.5, hw) - max(r.y - 0.5, -hw), 0.0, 1.0) * fImg.a : 0.0;
     paint = vec4(fImg.rgb * sa, sa) + F * fa * (1.0 - sa);
   } else if (kind == 0) {
-    paint = F * (span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0));
+    paint = F * (((int(fKind.y + 0.5) & 32) != 0 ? ringCoverage(pix + 0.5) : span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0)));
   } else {
     float dc = length(pix + 0.5 - fP.xy) - fP.z;
     if ((flags & 4) != 0) {
@@ -2312,7 +2369,7 @@ void main() {
   if ((flags & 8) != 0) paint = gradient(pix + 0.5, int(fColour.r * 255.0 + 0.5) + 256 * int(fColour.g * 255.0 + 0.5));
 #endif
   if (kind == 0) {
-    cov = span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0);
+    cov = ((int(fKind.y + 0.5) & 32) != 0 ? ringCoverage(pix + 0.5) : span(fP.x, fP.z, pix.x, pix.x + 1.0) * span(fP.y, fP.w, pix.y, pix.y + 1.0));
   } else if (kind == 1 && fP.w > 2.5) {
     // A simple polygon: inside by winding at the centre, the edge by distance.
     vec2 pc = pix + 0.5;
